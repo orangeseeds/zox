@@ -4,14 +4,10 @@ const scanner = @import("scanner.zig");
 const Literal = scanner.Literal;
 const Token = scanner.Token;
 
-const BinaryExpr = struct { left: *Expr, operator: Token, right: *Expr };
-const UnaryExpr = struct { operator: Token, right: *Expr };
-const GroupExpr = struct { expression: *Expr };
-const LiteralExpr = struct { value: Literal };
-
-const Vars = struct {
-    v: []*Expr = [_]*Expr{},
-};
+pub const BinaryExpr = struct { left: *Expr, operator: Token, right: *Expr };
+pub const UnaryExpr = struct { operator: Token, right: *Expr };
+pub const GroupExpr = struct { expression: *Expr };
+pub const LiteralExpr = struct { value: Literal };
 
 pub const Expr = union(enum) {
     const Self = @This();

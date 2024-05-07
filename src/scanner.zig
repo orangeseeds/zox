@@ -52,13 +52,17 @@ pub const TokenType = enum {
 };
 
 pub const Literal = union(enum) {
-    Identifier: []const u8,
     String: []const u8,
     Number: f64,
+    True,
+    False,
+    Nil,
 
     pub fn to_string(self: Literal) ![]const u8 {
         return switch (self) {
-            .Identifier => |ident| ident,
+            .True => "true",
+            .False => "false",
+            .Nil => "nil",
             .String => |str| str,
             .Number => |num| {
                 var buf: [100]u8 = undefined;
@@ -99,12 +103,12 @@ pub const Token = struct {
     }
 };
 
-pub const Error = struct {
+pub const ScannerError = struct {
     line: u32,
     col: u32,
     message: []const u8,
-    fn init(line: u32, col: u32, msg: []const u8) Error {
-        return Error{
+    fn init(line: u32, col: u32, msg: []const u8) ScannerError {
+        return ScannerError{
             .line = line,
             .col = col,
             .message = msg,
@@ -121,7 +125,7 @@ pub const Scanner = struct {
     col: u32 = 0,
     input: []const u8,
     tokens: std.ArrayList(Token),
-    errors: std.ArrayList(Error),
+    errors: std.ArrayList(ScannerError),
     keywords: std.StringArrayHashMap(TokenType),
 
     pub fn init(input: []const u8, allocator: std.mem.Allocator) !Scanner {
@@ -146,7 +150,7 @@ pub const Scanner = struct {
             .input = input,
             .tokens = std.ArrayList(Token).init(allocator),
             .keywords = keywords,
-            .errors = std.ArrayList(Error).init(allocator),
+            .errors = std.ArrayList(ScannerError).init(allocator),
         };
     }
 
@@ -164,7 +168,7 @@ pub const Scanner = struct {
 
     fn push_error(self: *Self, line: u32, col: u32, msg: []const u8) !void {
         self.has_error = true;
-        try self.errors.append(Error.init(line, col, msg));
+        try self.errors.append(ScannerError.init(line, col, msg));
     }
 
     fn at_end(self: Self) bool {
