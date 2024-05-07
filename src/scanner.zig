@@ -55,6 +55,18 @@ pub const Literal = union(enum) {
     Identifier: []const u8,
     String: []const u8,
     Number: f64,
+
+    pub fn to_string(self: Literal) ![]const u8 {
+        return switch (self) {
+            .Identifier => |ident| ident,
+            .String => |str| str,
+            .Number => |num| {
+                var buf: [100]u8 = undefined;
+                const result = try std.fmt.bufPrint(&buf, "{d}", .{num});
+                return result;
+            },
+        };
+    }
 };
 
 pub const Token = struct {
@@ -64,7 +76,7 @@ pub const Token = struct {
     literal: ?Literal,
     line_num: u32,
 
-    fn init(token_type: TokenType, lexeme: []const u8, literal: ?Literal, line_num: u32) Token {
+    pub fn init(token_type: TokenType, lexeme: []const u8, literal: ?Literal, line_num: u32) Token {
         return Token{
             .token_type = token_type,
             .lexeme = lexeme,
@@ -73,7 +85,7 @@ pub const Token = struct {
         };
     }
 
-    fn to_string(self: Self) ![]const u8 {
+    pub fn to_string(self: Self) ![]const u8 {
         var buf: [100]u8 = undefined;
         if (self.literal) |lit| {
             return switch (lit) {
@@ -82,7 +94,8 @@ pub const Token = struct {
                 .String => try std.fmt.bufPrint(&buf, "{} {s} {s}", .{ self.token_type, self.lexeme, lit.String }),
             };
         }
-        return try std.fmt.bufPrint(&buf, "{} {s}", .{ self.token_type, self.lexeme });
+        const result = try std.fmt.bufPrint(&buf, "{} {s}", .{ self.token_type, self.lexeme });
+        return result;
     }
 };
 
@@ -111,7 +124,7 @@ pub const Scanner = struct {
     errors: std.ArrayList(Error),
     keywords: std.StringArrayHashMap(TokenType),
 
-    fn init(input: []const u8, allocator: std.mem.Allocator) !Scanner {
+    pub fn init(input: []const u8, allocator: std.mem.Allocator) !Scanner {
         var keywords = std.StringArrayHashMap(TokenType).init(allocator);
         try keywords.put("and", .AND);
         try keywords.put("class", .CLASS);
@@ -185,12 +198,12 @@ pub const Scanner = struct {
         return char;
     }
 
-    fn scan_tokens(self: *Self) !void {
+    pub fn scan_tokens(self: *Self) !void {
         while (!self.at_end()) {
             self.start = self.current; // start is changing for reading multi-char lexeme
             try self.scan_token();
         }
-        try self.tokens.append(Token.init(.EOF, "", .{ .Identifier = "" }, self.line));
+        try self.add_token(.EOF);
     }
 
     fn add_token(self: *Self, token_type: TokenType) !void {
@@ -289,14 +302,14 @@ pub const Scanner = struct {
             },
         }
     }
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         self.keywords.deinit();
         self.tokens.deinit();
         self.errors.deinit();
     }
 };
 
-test "Test Scanner\n" {
+test "Test Scanner" {
     const input =
         \\ five = 5;
         \\ ten = 10;
@@ -327,6 +340,7 @@ test "Test Scanner\n" {
         \\ true and false;
         \\ true or false;
         \\ 
+        \\ \// This is a comment..
         \\ 10
         \\ 
         \\ 10
