@@ -11,10 +11,10 @@ pub const LiteralExpr = struct { value: ?Literal };
 
 pub const Expr = union(enum) {
     const Self = @This();
-    binary: BinaryExpr,
-    unary: UnaryExpr,
-    group: GroupExpr,
-    literal: LiteralExpr,
+    Binary: BinaryExpr,
+    Unary: UnaryExpr,
+    Group: GroupExpr,
+    Literal: LiteralExpr,
 
     fn parenthesize(allocator: std.mem.Allocator, name: []const u8, exprs: []const Expr) ![]const u8 {
         var buf = std.ArrayList(u8).init(allocator);
@@ -23,10 +23,10 @@ pub const Expr = union(enum) {
         for (exprs) |expr| {
             try buf.append(' ');
             const result = switch (expr) {
-                .binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
-                .unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
-                .group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
-                .literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
+                .Binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
+                .Unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
+                .Group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
+                .Literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
             };
             try buf.appendSlice(result);
         }
@@ -37,10 +37,10 @@ pub const Expr = union(enum) {
     pub fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).init(allocator);
         const result = switch (self) {
-            .binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
-            .unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
-            .group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
-            .literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
+            .Binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
+            .Unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
+            .Group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
+            .Literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
         };
         try buf.appendSlice(result);
         return buf.items;
@@ -52,12 +52,12 @@ test "Expression Visitor" {
     const allocator = arena.allocator();
     defer arena.deinit();
 
-    var inner = Expr{ .literal = .{ .value = .{ .Number = 100 } } };
-    var outer = Expr{ .unary = .{ .operator = Token.init(scanner.TokenType.MINUS, "-", null, 1), .right = &inner } };
+    var inner = Expr{ .Literal = .{ .value = .{ .Number = 100 } } };
+    var outer = Expr{ .Unary = .{ .operator = Token.init(scanner.TokenType.MINUS, "-", null, 1), .right = &inner } };
 
-    var left = Expr{ .literal = .{ .value = .{ .Number = 10 } } };
-    var right = Expr{ .group = .{ .expression = &outer } };
-    const expr: Expr = .{ .binary = .{
+    var left = Expr{ .Literal = .{ .value = .{ .Number = 10 } } };
+    var right = Expr{ .Group = .{ .expression = &outer } };
+    const expr: Expr = .{ .Binary = .{
         .left = &left,
         .operator = Token.init(scanner.TokenType.SLASH, "/", null, 1),
         .right = &right,

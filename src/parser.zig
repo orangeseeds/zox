@@ -1,6 +1,7 @@
 const std = @import("std");
 const expect = std.testing.expect;
 const scanner = @import("scanner.zig");
+const Scanner = scanner.Scanner;
 const expression_z = @import("expression.zig");
 const Expr = expression_z.Expr;
 const Token = scanner.Token;
@@ -24,14 +25,14 @@ pub const DetErr = struct {
     }
 };
 
-const Parser = struct {
+pub const Parser = struct {
     const Self = @This();
     current: u32 = 0,
     allocator: std.mem.Allocator,
     errors: std.ArrayList(DetErr),
     tokens: std.ArrayList(Token),
 
-    fn init(allocator: std.mem.Allocator, tokens: std.ArrayList(Token)) Self {
+    pub fn init(allocator: std.mem.Allocator, tokens: std.ArrayList(Token)) Self {
         return Self{
             .tokens = tokens,
             .allocator = allocator,
@@ -96,12 +97,12 @@ const Parser = struct {
     }
 
     fn primary(self: *Self) Error!Expr {
-        if (self.match(&[_]TokenType{.FALSE})) return Expr{ .literal = .{ .value = .False } };
-        if (self.match(&[_]TokenType{.TRUE})) return Expr{ .literal = .{ .value = .True } };
-        if (self.match(&[_]TokenType{.NIL})) return Expr{ .literal = .{ .value = .Nil } };
+        if (self.match(&[_]TokenType{.FALSE})) return Expr{ .Literal = .{ .value = .False } };
+        if (self.match(&[_]TokenType{.TRUE})) return Expr{ .Literal = .{ .value = .True } };
+        if (self.match(&[_]TokenType{.NIL})) return Expr{ .Literal = .{ .value = .Nil } };
 
         if (self.match(&[_]TokenType{ .NUMBER, .STRING })) {
-            return Expr{ .literal = .{ .value = self.previous().literal } }; // TODO: Handle Error Here!
+            return Expr{ .Literal = .{ .value = self.previous().literal } }; // TODO: Handle Error Here!
         }
 
         // check if the start is a LEFT_PAREN, read the immediate expr
@@ -109,7 +110,7 @@ const Parser = struct {
         if (self.match(&[_]TokenType{.LEFT_PAREN})) {
             var expr = try self.expression();
             _ = try self.consume(.RIGHT_PAREN, "Expected ')' after the expression.");
-            const new_expr = Expr{ .group = .{ .expression = &expr } };
+            const new_expr = Expr{ .Group = .{ .expression = &expr } };
             return new_expr;
         }
 
@@ -121,7 +122,7 @@ const Parser = struct {
         if (self.match(&[_]TokenType{ .BANG, .MINUS })) {
             const operator = self.previous();
             var right_exp = try self.unary();
-            return Expr{ .unary = .{ .right = &right_exp, .operator = operator } };
+            return Expr{ .Unary = .{ .right = &right_exp, .operator = operator } };
         }
 
         return try self.primary();
@@ -133,7 +134,7 @@ const Parser = struct {
         while (self.match(&[_]TokenType{ .SLASH, .STAR })) {
             const operator = self.previous();
             var right = try self.unary();
-            const new_expr = Expr{ .binary = .{ .left = &expr, .operator = operator, .right = &right } };
+            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
             return new_expr;
         }
 
@@ -146,7 +147,7 @@ const Parser = struct {
         while (self.match(&[_]TokenType{ .MINUS, .PLUS })) {
             const operator = self.previous();
             var right = try self.factor();
-            const new_expr = Expr{ .binary = .{ .left = &expr, .operator = operator, .right = &right } };
+            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
             return new_expr;
         }
 
@@ -159,7 +160,7 @@ const Parser = struct {
         while (self.match(&[_]TokenType{ .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL })) {
             const operator = self.previous();
             var right = try self.term();
-            const new_expr = Expr{ .binary = .{ .left = &expr, .operator = operator, .right = &right } };
+            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
             return new_expr;
         }
 
@@ -172,7 +173,7 @@ const Parser = struct {
         while (self.match(&[_]TokenType{ .BANG_EQUAL, .EQUAL_EQUAL })) {
             const operator = self.previous();
             var right = try self.comparison();
-            const new_expr = Expr{ .binary = .{ .left = &expr, .operator = operator, .right = &right } };
+            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
             return new_expr;
         }
 
@@ -204,11 +205,11 @@ const Parser = struct {
         _ = self.advance();
     }
 
-    fn parse(self: *Self) Error!Expr {
+    pub fn parse(self: *Self) Error!Expr {
         return try self.expression();
     }
 
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         self.tokens.deinit();
         self.errors.deinit();
     }
@@ -223,7 +224,7 @@ test "Testing the Parser" {
         \\ "apple"==(100 - 10);
     ;
 
-    var lexer = try scanner.Scanner.init(allocator, input);
+    var lexer = try Scanner.init(allocator, input);
     try lexer.scan_tokens();
 
     var parser = Parser.init(allocator, lexer.tokens);
