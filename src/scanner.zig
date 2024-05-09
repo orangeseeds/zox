@@ -58,16 +58,15 @@ pub const Literal = union(enum) {
     False,
     Nil,
 
-    pub fn to_string(self: Literal) ![]const u8 {
+    pub fn to_string(self: Literal, allocator: std.mem.Allocator) ![]const u8 {
+        // std.debug.print("{}\n", .{self});
         return switch (self) {
             .True => "true",
             .False => "false",
             .Nil => "nil",
             .String => |str| str,
             .Number => |num| {
-                var buf: [100]u8 = undefined;
-                const result = try std.fmt.bufPrint(&buf, "{d}", .{num});
-                return result;
+                return try std.fmt.allocPrint(allocator, "{d}", .{num});
             },
         };
     }
@@ -89,17 +88,11 @@ pub const Token = struct {
         };
     }
 
-    pub fn to_string(self: Self) ![]const u8 {
-        var buf: [100]u8 = undefined;
+    pub fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
         if (self.literal) |lit| {
-            return switch (lit) {
-                .Identifier => try std.fmt.bufPrint(&buf, "{} {s} {s}", .{ self.token_type, self.lexeme, lit.Identifier }),
-                .Number => try std.fmt.bufPrint(&buf, "{} {s} {d}", .{ self.token_type, self.lexeme, lit.Number }),
-                .String => try std.fmt.bufPrint(&buf, "{} {s} {s}", .{ self.token_type, self.lexeme, lit.String }),
-            };
+            return try std.fmt.allocPrint(allocator, "{} {s} {s}", .{ self.token_type, self.lexeme, try lit.to_string(allocator) });
         }
-        const result = try std.fmt.bufPrint(&buf, "{} {s}", .{ self.token_type, self.lexeme });
-        return result;
+        return try std.fmt.bufPrint(allocator, "{} {s}", .{ self.token_type, self.lexeme });
     }
 };
 
@@ -124,11 +117,12 @@ pub const Scanner = struct {
     line: u32 = 1,
     col: u32 = 0,
     input: []const u8,
+    allocator: std.mem.Allocator,
     tokens: std.ArrayList(Token),
     errors: std.ArrayList(ScannerError),
     keywords: std.StringArrayHashMap(TokenType),
 
-    pub fn init(input: []const u8, allocator: std.mem.Allocator) !Scanner {
+    pub fn init(allocator: std.mem.Allocator, input: []const u8) !Scanner {
         var keywords = std.StringArrayHashMap(TokenType).init(allocator);
         try keywords.put("and", .AND);
         try keywords.put("class", .CLASS);
@@ -148,8 +142,9 @@ pub const Scanner = struct {
         try keywords.put("while", .WHILE);
         return Scanner{
             .input = input,
-            .tokens = std.ArrayList(Token).init(allocator),
+            .allocator = allocator,
             .keywords = keywords,
+            .tokens = std.ArrayList(Token).init(allocator),
             .errors = std.ArrayList(ScannerError).init(allocator),
         };
     }
@@ -205,7 +200,7 @@ pub const Scanner = struct {
     pub fn scan_tokens(self: *Self) !void {
         while (!self.at_end()) {
             self.start = self.current; // start is changing for reading multi-char lexeme
-            try self.scan_token();
+            try self.scan_token(); // TODO: Handler bubbled errors here, OutOfMemory error return, other scanner error add to error list.
         }
         try self.add_token(.EOF);
     }
@@ -487,7 +482,7 @@ test "Test Scanner" {
         .EOF,
     };
 
-    var scanner = try Scanner.init(input, std.testing.allocator);
+    var scanner = try Scanner.init(std.testing.allocator, input);
     defer scanner.deinit();
 
     try scanner.scan_tokens();

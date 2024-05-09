@@ -7,7 +7,7 @@ const Token = scanner.Token;
 pub const BinaryExpr = struct { left: *Expr, operator: Token, right: *Expr };
 pub const UnaryExpr = struct { operator: Token, right: *Expr };
 pub const GroupExpr = struct { expression: *Expr };
-pub const LiteralExpr = struct { value: Literal };
+pub const LiteralExpr = struct { value: ?Literal };
 
 pub const Expr = union(enum) {
     const Self = @This();
@@ -26,7 +26,7 @@ pub const Expr = union(enum) {
                 .binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
                 .unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
                 .group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
-                .literal => |lit| try lit.value.to_string(),
+                .literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
             };
             try buf.appendSlice(result);
         }
@@ -34,13 +34,13 @@ pub const Expr = union(enum) {
         return buf.items;
     }
 
-    fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
         var buf = std.ArrayList(u8).init(allocator);
         const result = switch (self) {
             .binary => |b_expr| try parenthesize(allocator, b_expr.operator.lexeme, &[_]Expr{ b_expr.left.*, b_expr.right.* }),
             .unary => |u_expr| try parenthesize(allocator, u_expr.operator.lexeme, &[_]Expr{u_expr.right.*}),
             .group => |grp| try parenthesize(allocator, "group", &[_]Expr{grp.expression.*}),
-            .literal => |lit| try lit.value.to_string(),
+            .literal => |lit| if (lit.value) |val| try val.to_string(allocator) else "literal_none",
         };
         try buf.appendSlice(result);
         return buf.items;
@@ -62,5 +62,6 @@ test "Expression Visitor" {
         .operator = Token.init(scanner.TokenType.SLASH, "/", null, 1),
         .right = &right,
     } };
+
     try std.testing.expectFmt("(/ 10 (group (- 100)))", "{s}", .{try expr.to_string(allocator)});
 }
