@@ -47,6 +47,13 @@ pub const Expr = union(enum) {
     }
 };
 
+pub const ExprStmt = struct { expression: Expr };
+pub const PrintStmt = struct { expression: Expr };
+pub const Stmt = union(enum) {
+    Expr: ExprStmt,
+    Print: ExprStmt,
+};
+
 test "Expression Visitor" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();

@@ -4,6 +4,7 @@ const scanner = @import("scanner.zig");
 const Scanner = scanner.Scanner;
 const expression_z = @import("expression.zig");
 const Expr = expression_z.Expr;
+const Stmt = expression_z.Stmt;
 const Token = scanner.Token;
 const Literal = scanner.Literal;
 const TokenType = scanner.TokenType;
@@ -212,6 +213,29 @@ pub const Parser = struct {
     pub fn deinit(self: *Self) void {
         self.tokens.deinit();
         self.errors.deinit();
+    }
+
+    /// Handling Statements
+    ///
+    fn print_stmt(self: *Self) !Stmt {
+        const val = try self.expression();
+        _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
+        return Stmt{ .Print = .{ .expression = val } };
+    }
+    fn expression_stmt(self: *Self) !Stmt {
+        const val = try self.expression();
+        _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
+        return Stmt{ .Expr = .{ .expression = val } };
+    }
+    fn statement(self: *Self) !Stmt {
+        if (self.match(&[_]TokenType{TokenType.PRINT})) return try self.print_stmt();
+        return try self.expression_stmt();
+    }
+
+    pub fn parse_stmts(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(Stmt) {
+        var stmts = std.ArrayList(Stmt).init(allocator);
+        while (!self.at_end()) try stmts.append(try self.statement());
+        return stmts;
     }
 };
 

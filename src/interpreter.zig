@@ -1,6 +1,7 @@
 const std = @import("std");
 const expr = @import("expression.zig");
 const Expr = expr.Expr;
+const Stmt = expr.Stmt;
 const scanner = @import("scanner.zig");
 const parser = @import("parser.zig");
 const Literal = scanner.Literal;
@@ -25,11 +26,11 @@ const Value = union(enum) {
     }
 };
 
-pub const Iterpreter = struct {
+pub const Interpreter = struct {
     fn is_truthy(value: Value) bool {
         return switch (value) {
-            Value.Bool => |val| val,
-            Value.Nil => false,
+            .Bool => |val| val,
+            .Nil => false,
             else => true,
         };
     }
@@ -101,6 +102,20 @@ pub const Iterpreter = struct {
         return evaluate(expression.expression.*);
     }
 
+    // Evaluating expressions
+    fn eval_expr_stmt(expression: Expr) void {
+        _ = evaluate(expression);
+        // TODO: Maybe you need to do something else;
+    }
+    fn eval_print_stmt(expression: Expr) void {
+        const val = evaluate(expression);
+        switch (val) {
+            .Number => |num| std.debug.print("{d}", .{num}),
+            .String => |str| std.debug.print("{s}", .{str}),
+            .Bool => |b| std.debug.print("{}", .{b}),
+            .Nil => std.debug.print("nil", .{}),
+        }
+    }
     pub fn evaluate(expression: expr.Expr) Value {
         return switch (expression) {
             .Binary => evaluate_binary(expression.Binary),
@@ -109,13 +124,26 @@ pub const Iterpreter = struct {
             .Literal => evaluate_literal(expression.Literal),
         };
     }
+
+    fn execute(stmt: expr.Stmt) !void {
+        switch (stmt) {
+            .Print => |p| eval_print_stmt(p.expression),
+            .Expr => |e| eval_expr_stmt(e.expression),
+            // else => std.debug.print("{s}", .{"runtime error"}),
+        }
+    }
+
+    pub fn interpret(statements: []Stmt) !void {
+        for (statements) |value| try execute(value);
+    }
 };
 
-test "Testing Interpreter" {
+test "Testing Expression Evaluation" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    const expected = 130;
     const input =
         \\ (((10 + (10 * (100 / 10))) + 10) + 10) ;
     ;
@@ -126,7 +154,26 @@ test "Testing Interpreter" {
     var par = parser.Parser.init(allocator, lexer.tokens);
     const exp = try par.parse();
 
-    const val = Iterpreter.evaluate(exp);
+    const val = Interpreter.evaluate(exp);
+    switch (val) {
+        .Number => |num| try std.testing.expect(expected == num),
+        else => unreachable,
+    }
+}
 
-    std.debug.print("\n{d}\n", .{val.Number});
+test "Testing Print Expression\n" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const input =
+        \\ print("apple");
+    ;
+
+    var lexer = try scanner.Scanner.init(allocator, input);
+    try lexer.scan_tokens();
+    var par = parser.Parser.init(allocator, lexer.tokens);
+    const stmts = try par.parse_stmts(allocator);
+    try Interpreter.interpret(stmts.items);
+    std.debug.print("\n", .{});
 }
