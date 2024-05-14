@@ -167,7 +167,7 @@ test "Testing Print Expression\n" {
     const allocator = arena.allocator();
 
     const input =
-        \\ print("apple");
+        \\ print((10/20)*10);
     ;
 
     var lexer = try scanner.Scanner.init(allocator, input);

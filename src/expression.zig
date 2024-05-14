@@ -51,7 +51,7 @@ pub const ExprStmt = struct { expression: Expr };
 pub const PrintStmt = struct { expression: Expr };
 pub const Stmt = union(enum) {
     Expr: ExprStmt,
-    Print: ExprStmt,
+    Print: PrintStmt,
 };
 
 test "Expression Visitor" {
