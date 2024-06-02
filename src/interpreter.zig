@@ -1,18 +1,35 @@
 const std = @import("std");
 const expr = @import("expression.zig");
+const parser = @import("parser.zig");
+const env = @import("environment.zig");
+
+const Allocator = std.mem.Allocator;
+
 const Expr = expr.Expr;
+const LiteralExpr = expr.LiteralExpr;
+const UnaryExpr = expr.UnaryExpr;
+const BinaryExpr = expr.BinaryExpr;
+const GroupExpr = expr.GroupExpr;
+const AssignExpr = expr.AssignExpr;
+const VariableExpr = expr.VariableExpr;
+
 const Stmt = expr.Stmt;
+const ExprStmt = expr.ExprStmt;
+const PrintStmt = expr.PrintStmt;
+const VarStmt = expr.VarStmt;
+const BlockStmt = expr.BlockStmt;
+
 const scanner = @import("scanner.zig");
 const Token = scanner.Token;
-const parser = @import("parser.zig");
-const Literal = scanner.Literal;
-const TokenType = @import("scanner.zig").TokenType;
-const env = @import("environment.zig");
-const Environment = env.Environment;
 
-const EvalErrors = error{
-    TypeErrorNumbers,
-    TypeErrorStrings,
+const Literal = scanner.Literal;
+const TokenType = scanner.TokenType;
+const Environment = env.Environment;
+const EnvError = env.EnvError;
+
+const RuntimeError = error{
+    BinaryOperandMismatch,
+    UnaryOperandMismatch,
     IllegalOperator,
     UndefinedVar,
 } || std.mem.Allocator.Error;
@@ -67,15 +84,18 @@ fn check_op_types(expected: ValueType, left: Value, right: Value) bool {
 
 pub const Interpreter = struct {
     const Self = @This();
-    allocator: std.mem.Allocator,
-    runtime_error: struct { message: []const u8, token: Token } = .{
-        .message = undefined,
-        .token = undefined,
-    },
+    const Error = struct {
+        err: RuntimeError,
+        message: []const u8,
+        token: Token,
+    };
+
+    allocator: Allocator,
+    runtime_error: Error = .{ .err = undefined, .token = undefined, .message = undefined },
     has_error: bool = false,
     environment: Environment,
 
-    fn init(allocator: std.mem.Allocator) Self {
+    fn init(allocator: Allocator) Self {
         return Self{
             .allocator = allocator,
             .environment = Environment.init(allocator),
@@ -85,14 +105,18 @@ pub const Interpreter = struct {
         try self.environment.deinit();
     }
 
-    fn raise_err(self: *Self, err: EvalErrors, message: []const u8, token: Token) EvalErrors {
-        self.runtime_error = .{ .message = message, .token = token };
+    fn raise_err(self: *Self, err: RuntimeError, token: Token, comptime fmt: []const u8, args: anytype) RuntimeError!void {
         self.has_error = true;
+        self.runtime_error = .{
+            .err = err,
+            .message = try std.fmt.allocPrint(self.allocator, fmt, args),
+            .token = token,
+        };
         return err;
     }
 
-    fn evaluate_literal(expression: expr.LiteralExpr) Value {
-        if (expression.value) |val| {
+    fn evaluate_literal(e: LiteralExpr) Value {
+        if (e.value) |val| {
             return switch (val) {
                 .String => |str| Value{ .String = str },
                 .Number => |num| Value{ .Number = num },
@@ -100,33 +124,57 @@ pub const Interpreter = struct {
                 .False => Value{ .Bool = false },
                 .Nil => Value{ .Nil = undefined },
             };
-        } else {
-            unreachable;
         }
+        unreachable;
     }
 
-    fn evaluate_unary(self: *Self, expression: expr.UnaryExpr) EvalErrors!Value {
-        const right = try self.evaluate_expr(expression.right.*);
+    fn evaluate_unary(self: *Self, e: UnaryExpr) RuntimeError!Value {
+        const right = try self.evaluate_expr(e.right.*);
 
-        switch (expression.operator.token_type) {
+        switch (e.operator.token_type) {
             .MINUS => {
-                if (!check_op_type(.Number, right))
-                    return self.raise_err(error.TypeErrorNumbers, "Operand must be a number", expression.operator);
+                if (!check_op_type(.Number, right)) {
+                    try self.raise_err(
+                        error.UnaryOperandMismatch,
+                        e.operator,
+                        "invalid operand for unary op {s} on type {s} at line={d},col={d}",
+                        .{ e.operator.lexeme, @tagName(right), e.operator.line_num, e.operator.col },
+                    );
+                }
                 return Value{ .Number = -right.Number };
             },
             .BANG => return Value{ .Bool = !right.is_truthy() },
-            else => return self.raise_err(error.IllegalOperator, "Invalid Operator for unary expr", expression.operator),
+            else => {
+                try self.raise_err(
+                    error.IllegalOperator,
+                    e.operator,
+                    "illegal unary op {s} at line={d},col={d}",
+                    .{ e.operator.lexeme, e.operator.line_num, e.operator.col },
+                );
+                return error.IllegalOperator;
+            },
         }
     }
 
-    fn evaluate_binary(self: *Self, expression: expr.BinaryExpr) EvalErrors!Value {
-        const left = try self.evaluate_expr(expression.left.*);
-        const right = try self.evaluate_expr(expression.right.*);
+    fn evaluate_binary(self: *Self, e: BinaryExpr) RuntimeError!Value {
+        const left = try self.evaluate_expr(e.left.*);
+        const right = try self.evaluate_expr(e.right.*);
 
         if (!check_op_types(.Number, left, right))
-            return self.raise_err(error.TypeErrorNumbers, "Operand must be a number", expression.operator);
+            try self.raise_err(
+                error.BinaryOperandMismatch,
+                e.operator,
+                "invalid operands for binary op {s} on types {s} and {s} at line={d},col={d}",
+                .{
+                    e.operator.lexeme,
+                    @tagName(left),
+                    @tagName(right),
+                    e.operator.line_num,
+                    e.operator.col,
+                },
+            );
 
-        return switch (expression.operator.token_type) {
+        return switch (e.operator.token_type) {
             .MINUS => Value{ .Number = left.Number - right.Number },
             .SLASH => Value{ .Number = left.Number / right.Number },
             .STAR => Value{ .Number = left.Number * right.Number },
@@ -137,31 +185,58 @@ pub const Interpreter = struct {
             .LESS_EQUAL => Value{ .Bool = left.Number <= right.Number },
             .BANG_EQUAL => Value{ .Bool = !left.equal(right) },
             .EQUAL_EQUAL => Value{ .Bool = left.equal(right) },
-            else => return self.raise_err(error.IllegalOperator, "Illegal Operator for binary expr", expression.operator),
+            else => {
+                try self.raise_err(
+                    error.IllegalOperator,
+                    e.operator,
+                    "illegal binary op {s} at line={d},col={d}",
+                    .{ e.operator.lexeme, e.operator.line_num, e.operator.col },
+                );
+                return error.IllegalOperator;
+            },
         };
     }
 
-    fn evaluate_group(self: *Self, expression: expr.GroupExpr) EvalErrors!Value {
-        return try self.evaluate_expr(expression.expression.*);
+    fn evaluate_group(self: *Self, e: GroupExpr) RuntimeError!Value {
+        return try self.evaluate_expr(e.expression.*);
     }
 
-    fn eval_var_expr(self: *Self, expression: expr.VariableExpr) EvalErrors!Value {
-        return self.environment.get(expression.name.lexeme) catch |err| switch (err) {
-            env.EnvError.NotDeclaredAndUndefined => return self.raise_err(error.UndefinedVar, "Not Declared and Undefined", expression.name),
-            env.EnvError.DeclaredButUndefined => return self.raise_err(error.UndefinedVar, "Declared But Undefined", expression.name),
+    fn eval_var_expr(self: *Self, e: VariableExpr) RuntimeError!Value {
+        const val = self.environment.get(e.name.lexeme) catch |err| {
+            switch (err) {
+                error.NotDeclaredAndUndefined => try self.raise_err(
+                    error.UndefinedVar,
+                    e.name,
+                    "use of undefined var '{s}' at line={d},col={d}. {s} was never declared.",
+                    .{ e.name.lexeme, e.name.line_num, e.name.col, e.name.lexeme },
+                ),
+                error.DeclaredButUndefined => try self.raise_err(
+                    error.UndefinedVar,
+                    e.name,
+                    "use of undefined var '{s}' at line={d},col={d}. But {s} was previously declared.",
+                    .{ e.name.lexeme, e.name.line_num, e.name.col, e.name.lexeme },
+                ),
+            }
+            return error.UndefinedVar;
         };
+        return val;
     }
 
-    fn eval_asgn_expr(self: *Self, expression: expr.AssignExpr) EvalErrors!Value {
-        // TODO: handle error better write tests
-        const value = try self.evaluate_expr(expression.value.*);
-        self.environment.assign(expression.name, value) catch
-            return self.raise_err(error.UndefinedVar, "Not Declared and Undefined", expression.name);
+    fn eval_asgn_expr(self: *Self, e: AssignExpr) RuntimeError!Value {
+        // TODO: write tests
+        const value = try self.evaluate_expr(e.value.*);
+        self.environment.assign(e.name, value) catch
+            try self.raise_err(
+            error.UndefinedVar,
+            e.name,
+            "use of undefined var '{s}' at line={d},col={d}. {s} was never declared.",
+            .{ e.name.lexeme, e.name.line_num, e.name.col, e.name.lexeme },
+        );
         return value;
     }
 
-    pub fn evaluate_expr(self: *Self, expression: expr.Expr) EvalErrors!Value {
-        return switch (expression) {
+    pub fn evaluate_expr(self: *Self, e: Expr) RuntimeError!Value {
+        return switch (e) {
             .Binary => |bin| try self.evaluate_binary(bin),
             .Unary => |un| try self.evaluate_unary(un),
             .Group => |grp| try self.evaluate_group(grp),
@@ -171,11 +246,11 @@ pub const Interpreter = struct {
         };
     }
 
-    fn execute_blk(self: *Self, stmts: std.ArrayList(Stmt), environment: Environment) EvalErrors!void {
+    fn execute_blk(self: *Self, stmts: std.ArrayList(Stmt), envr: Environment) RuntimeError!void {
         // TODO: write tests for block
         const prev = self.environment;
 
-        self.environment = environment;
+        self.environment = envr;
         for (stmts) |stmt| {
             try self.evaluate_stmt(stmt);
         }
@@ -184,25 +259,25 @@ pub const Interpreter = struct {
     }
 
     // Evaluating Statements
-    fn eval_print_stmt(self: *Self, expression: expr.PrintStmt) EvalErrors!void {
-        const val = try self.evaluate_expr(expression);
+    fn eval_print_stmt(self: *Self, e: PrintStmt) RuntimeError!void {
+        const val = try self.evaluate_expr(e);
         std.debug.print("{}\n", .{val});
     }
-    fn eval_expr_stmt(self: *Self, expression: expr.ExprStmt) EvalErrors!Value {
-        return try self.evaluate_expr(expression);
+    fn eval_expr_stmt(self: *Self, e: ExprStmt) RuntimeError!Value {
+        return try self.evaluate_expr(e);
     }
-    fn eval_var_stmt(self: *Self, expression: expr.VarStmt) EvalErrors!void {
+    fn eval_var_stmt(self: *Self, e: VarStmt) RuntimeError!void {
         var val: ?Value = null;
-        if (expression.initializer) |exp| {
-            val = try self.evaluate_expr(exp);
+        if (e.initializer) |in| {
+            val = try self.evaluate_expr(in);
         }
-        try self.environment.define(expression.name.lexeme, val);
+        try self.environment.define(e.name.lexeme, val);
     }
-    fn eval_blk_stmt(self: *Self, stmt: expr.BlockStmt) EvalErrors!void {
+    fn eval_block_stmt(self: *Self, stmt: BlockStmt) RuntimeError!void {
         self.execute_blk(stmt, Environment.with_enclosing(self.allocator, self.environment));
     }
 
-    fn evaluate_stmt(self: *Self, stmt: expr.Stmt) EvalErrors!void {
+    fn evaluate_stmt(self: *Self, stmt: Stmt) RuntimeError!void {
         switch (stmt) {
             .PrintStmt => |s| try self.eval_print_stmt(s),
             .ExprStmt => |e| _ = try self.eval_expr_stmt(e),
@@ -237,7 +312,7 @@ test "Variable Expression Evaluations" {
     var interpreter = Interpreter.init(allocator);
     try interpreter.evaluate_stmt(var_stmt);
 
-    const val = try interpreter.eval_var_expr(expr.VariableExpr{ .name = var_stmt.VarStmt.name });
+    const val = try interpreter.eval_var_expr(VariableExpr{ .name = var_stmt.VarStmt.name });
 
     try std.testing.expect(val.equal(Value{ .Number = 400 }));
 }
