@@ -12,6 +12,7 @@ pub const Environment = struct {
     const Self = @This();
     const EnvMap = std.StringArrayHashMap(?Value);
     values: EnvMap,
+    /// outer environment
     enclosing: *Environment,
 
     pub fn init(allocator: Allocator) Self {
@@ -36,7 +37,8 @@ pub const Environment = struct {
                 error.DeclaredButUndefined;
         }
 
-        if (self.enclosing == undefined) return try self.enclosing.get(name);
+        if (self.enclosing != undefined)
+            return try self.enclosing.get(name);
 
         return error.NotDeclaredAndUndefined;
     }

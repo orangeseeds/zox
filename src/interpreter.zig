@@ -2,6 +2,10 @@ const std = @import("std");
 const expr = @import("expression.zig");
 const parser = @import("parser.zig");
 const env = @import("environment.zig");
+const scanner = @import("scanner.zig");
+
+const Parser = parser.Parser;
+const Scanner = scanner.Scanner;
 
 const Allocator = std.mem.Allocator;
 
@@ -19,7 +23,6 @@ const PrintStmt = expr.PrintStmt;
 const VarStmt = expr.VarStmt;
 const BlockStmt = expr.BlockStmt;
 
-const scanner = @import("scanner.zig");
 const Token = scanner.Token;
 
 const Literal = scanner.Literal;
@@ -246,12 +249,12 @@ pub const Interpreter = struct {
         };
     }
 
-    fn execute_blk(self: *Self, stmts: std.ArrayList(Stmt), envr: Environment) RuntimeError!void {
+    fn eval_block(self: *Self, stmts: std.ArrayList(Stmt), envr: Environment) RuntimeError!void {
         // TODO: write tests for block
         const prev = self.environment;
 
         self.environment = envr;
-        for (stmts) |stmt| {
+        for (stmts.items) |stmt| {
             try self.evaluate_stmt(stmt);
         }
 
@@ -261,7 +264,12 @@ pub const Interpreter = struct {
     // Evaluating Statements
     fn eval_print_stmt(self: *Self, e: PrintStmt) RuntimeError!void {
         const val = try self.evaluate_expr(e);
-        std.debug.print("{}\n", .{val});
+        switch (val) {
+            .String => |str| std.debug.print("{s}", .{str}),
+            .Number => |num| std.debug.print("{d}", .{num}),
+            .Bool => |b| std.debug.print("{?}", .{b}),
+            .Nil => std.debug.print("nil", .{}),
+        }
     }
     fn eval_expr_stmt(self: *Self, e: ExprStmt) RuntimeError!Value {
         return try self.evaluate_expr(e);
@@ -274,7 +282,9 @@ pub const Interpreter = struct {
         try self.environment.define(e.name.lexeme, val);
     }
     fn eval_block_stmt(self: *Self, stmt: BlockStmt) RuntimeError!void {
-        self.execute_blk(stmt, Environment.with_enclosing(self.allocator, self.environment));
+        const enclosing = try self.allocator.create(Environment);
+        enclosing.* = self.environment;
+        try self.eval_block(stmt, Environment.with_enclosing(self.allocator, enclosing));
     }
 
     fn evaluate_stmt(self: *Self, stmt: Stmt) RuntimeError!void {
@@ -282,54 +292,104 @@ pub const Interpreter = struct {
             .PrintStmt => |s| try self.eval_print_stmt(s),
             .ExprStmt => |e| _ = try self.eval_expr_stmt(e),
             .VarStmt => |v| try self.eval_var_stmt(v),
-            else => unreachable,
+            .BlockStmt => |b| try self.eval_block_stmt(b),
         }
     }
 };
 
-test "Assignment Expression" {}
-test "Variable Expression" {}
-test "General Expression Evaluation" {}
-
-test "Variable Expression Evaluations" {
+test "Block Statement" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const src = "var value = (20 * 20);";
+    const src =
+        \\ var outer = 10;
+        \\ { 
+        \\    var value = (20 * 20); 
+        \\    outer;
+        \\    value;
+        \\ }
+        \\ outer;
+    ;
+
     var lexer = try scanner.Scanner.init(allocator, src);
-    defer lexer.deinit();
     try lexer.scan_tokens();
 
     var par = parser.Parser.init(allocator, try lexer.tokens.clone());
-    defer par.deinit();
 
-    var stmts = try par.parse_stmts(allocator);
-    defer stmts.deinit();
-
-    const var_stmt = stmts.pop();
+    const stmts = try par.parse_stmts(allocator);
+    // std.debug.print("{s}", .{(try stmts.items[0].to_string(allocator)).items});
 
     var interpreter = Interpreter.init(allocator);
-    try interpreter.evaluate_stmt(var_stmt);
 
-    const val = try interpreter.eval_var_expr(VariableExpr{ .name = var_stmt.VarStmt.name });
-
-    try std.testing.expect(val.equal(Value{ .Number = 400 }));
+    for (stmts.items) |stmt| {
+        try interpreter.evaluate_stmt(stmt);
+    }
 }
 
-test "Testing Expression Stmt Evaluations" {
+test "Declaration & Assignment Expression" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const table = [_]struct { []const u8, Value }{
-        .{ "\"true\";", val_str("true") },
-    };
+    const src =
+        \\ var value = (20 * 20);
+    ;
 
-    for (table) |value| {
-        const result = try eval_str(allocator, value[0]);
-        std.debug.print("\n{s} {s}\n", .{ result.String, value[1].String });
-        try std.testing.expect(result.equal(value[1]));
+    var lexer = try scanner.Scanner.init(allocator, src);
+    try lexer.scan_tokens();
+
+    var par = parser.Parser.init(allocator, try lexer.tokens.clone());
+
+    const stmts = try par.parse_stmts(allocator);
+
+    var interpreter = Interpreter.init(allocator);
+
+    try interpreter.evaluate_stmt(stmts.items[0]);
+    var val = try interpreter.environment.get("value");
+    try std.testing.expect(val.equal(val_num(400)));
+
+    // try interpreter.evaluate_stmt(stmts.items[1]);
+    // val = try interpreter.environment.get("value");
+    // try std.testing.expect(val.equal(val_num(400)));
+}
+
+test "Expression Statement Evaluations" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const table = [_]struct { []const u8, Value }{
+        .{ "true;", val_bool(true) },
+        .{ "false;", val_bool(false) },
+        .{ "!false;", val_bool(true) },
+        .{ "!true;", val_bool(false) },
+        .{ "1;", val_num(1) },
+        .{ "-1;", val_num(-1) },
+
+        .{ "10 > 11;", val_bool(false) },
+        .{ "10 < 11;", val_bool(true) },
+        .{ "10 >= 10;", val_bool(true) },
+        .{ "10 <= 10;", val_bool(true) },
+        .{ "10 <= 11;", val_bool(true) },
+        .{ "10 <= 9;", val_bool(false) },
+
+        .{ "10 == 9;", val_bool(false) },
+        .{ "10 == 10;", val_bool(true) },
+        .{ "10 != 10;", val_bool(false) },
+        .{ "10 != 9;", val_bool(true) },
+
+        .{ "1+1;", val_num(2) },
+        .{ "2*3;", val_num(6) },
+        .{ "6/3;", val_num(2) },
+        .{ "6-3;", val_num(3) },
+
+        .{ "\"hello world\";", val_str("hello world") },
+    };
+    for (table) |val| {
+        const evaluated = try eval_str(alloc, val[0]);
+        // std.debug.print("\n{} {}\n", .{ evaluated, val[1] });
+        try std.testing.expect(evaluated.equal(val[1]));
     }
 }
 
@@ -343,19 +403,15 @@ fn val_num(val: f32) Value {
     return Value{ .Number = val };
 }
 
-fn eval_str(allocator: std.mem.Allocator, str: []const u8) !Value {
-    var lexer = try scanner.Scanner.init(allocator, str);
-    defer lexer.deinit();
-    try lexer.scan_tokens();
+/// Only works for expression statements.
+fn eval_str(alloc: std.mem.Allocator, str: []const u8) !Value {
+    var lex = try Scanner.init(alloc, str);
+    try lex.scan_tokens();
+    var p = Parser.init(alloc, try lex.tokens.clone());
+    var stmts = try p.parse_stmts(alloc);
 
-    var par = parser.Parser.init(allocator, try lexer.tokens.clone());
-    defer par.deinit();
-
-    var stmts = try par.parse_stmts(allocator);
-    defer stmts.deinit();
-
-    var interpreter = Interpreter.init(allocator);
-    const val = try allocator.create(Value);
+    var interpreter = Interpreter.init(alloc);
+    const val = try alloc.create(Value);
     val.* = try interpreter.eval_expr_stmt(stmts.pop().ExprStmt);
     return val.*;
 }

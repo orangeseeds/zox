@@ -224,11 +224,12 @@ pub const Parser = struct {
     fn block(self: *Self) Error!std.ArrayList(Stmt) {
         var stmts = std.ArrayList(Stmt).init(self.allocator);
 
-        while (!self.check(.RIGHT_BRACE)) {
+        while (!self.check(.RIGHT_BRACE) and !self.at_end()) {
             try stmts.append(try self.declaration());
+            // std.debug.print("{}\n", .{self.peek()});
         }
 
-        _ = self.consume(.RIGHT_BRACE, "Expecte '}' after block.");
+        _ = try self.consume(.RIGHT_BRACE, "Expected '}' after block.");
         return stmts;
     }
 
@@ -307,12 +308,13 @@ pub const Parser = struct {
     }
 
     fn statement(self: *Self) !Stmt {
-        if (self.match(.{TokenType.PRINT})) return try self.print_stmt();
+        if (self.match(.{.PRINT})) return try self.print_stmt();
+        if (self.match(.{.LEFT_BRACE})) return Stmt{ .BlockStmt = try self.block() };
         return try self.expression_stmt();
     }
 
-    pub fn parse_stmts(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(Stmt) {
-        var stmts = std.ArrayList(Stmt).init(allocator);
+    pub fn parse_stmts(self: *Self, alloc: std.mem.Allocator) !std.ArrayList(Stmt) {
+        var stmts = std.ArrayList(Stmt).init(alloc);
         while (!self.at_end()) {
             // try stmts.append(try self.statement());
             try stmts.append(try self.declaration());
