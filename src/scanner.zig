@@ -1,4 +1,6 @@
 const std = @import("std");
+const fmt = std.fmt;
+const Allocator = std.mem.Allocator;
 const expect = std.testing.expect;
 
 pub const TokenType = enum {
@@ -58,15 +60,14 @@ pub const Literal = union(enum) {
     False,
     Nil,
 
-    pub fn to_string(self: Literal, allocator: std.mem.Allocator) ![]const u8 {
-        // std.debug.print("{}\n", .{self});
+    pub fn to_string(self: Literal, allocator: Allocator) ![]const u8 {
         return switch (self) {
             .True => "true",
             .False => "false",
             .Nil => "nil",
             .String => |str| str,
             .Number => |num| {
-                return try std.fmt.allocPrint(allocator, "{d}", .{num});
+                return try fmt.allocPrint(allocator, "{d}", .{num});
             },
         };
     }
@@ -78,51 +79,51 @@ pub const Token = struct {
     lexeme: []const u8,
     literal: ?Literal,
     line_num: u32,
+    col: u32,
 
-    pub fn init(token_type: TokenType, lexeme: []const u8, literal: ?Literal, line_num: u32) Token {
+    pub fn init(token_type: TokenType, lexeme: []const u8, literal: ?Literal, line_num: u32, col: u32) Token {
         return Token{
             .token_type = token_type,
             .lexeme = lexeme,
             .literal = literal,
             .line_num = line_num,
+            .col = col,
         };
     }
 
-    pub fn to_string(self: Self, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn to_string(self: Self, allocator: Allocator) ![]const u8 {
         if (self.literal) |lit| {
-            return try std.fmt.allocPrint(allocator, "{} {s} {s}", .{ self.token_type, self.lexeme, try lit.to_string(allocator) });
+            return try fmt.allocPrint(allocator, "{} {s} {s}", .{ self.token_type, self.lexeme, try lit.to_string(allocator) });
         }
-        return try std.fmt.bufPrint(allocator, "{} {s}", .{ self.token_type, self.lexeme });
+        return try fmt.allocPrint(allocator, "{} {s}", .{ self.token_type, self.lexeme });
     }
 };
 
-pub const ScannerError = struct {
-    line: u32,
-    col: u32,
-    message: []const u8,
-    fn init(line: u32, col: u32, msg: []const u8) ScannerError {
-        return ScannerError{
-            .line = line,
-            .col = col,
-            .message = msg,
-        };
-    }
+pub const Error = error{
+    UnexpectedCharacter,
+    InvalidNumber,
+    UnterminatedString,
 };
 
 pub const Scanner = struct {
     const Self = @This();
+    const ErrorDetail = struct {
+        line: u32,
+        col: u32,
+        err: Error,
+    };
     has_error: bool = false,
     start: u32 = 0,
     current: u32 = 0,
     line: u32 = 1,
     col: u32 = 0,
     input: []const u8,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     tokens: std.ArrayList(Token),
-    errors: std.ArrayList(ScannerError),
+    errors: std.ArrayList(ErrorDetail),
     keywords: std.StringArrayHashMap(TokenType),
 
-    pub fn init(allocator: std.mem.Allocator, input: []const u8) !Scanner {
+    pub fn init(allocator: Allocator, input: []const u8) !Scanner {
         var keywords = std.StringArrayHashMap(TokenType).init(allocator);
         try keywords.put("and", .AND);
         try keywords.put("class", .CLASS);
@@ -145,7 +146,7 @@ pub const Scanner = struct {
             .allocator = allocator,
             .keywords = keywords,
             .tokens = std.ArrayList(Token).init(allocator),
-            .errors = std.ArrayList(ScannerError).init(allocator),
+            .errors = std.ArrayList(ErrorDetail).init(allocator),
         };
     }
 
@@ -161,9 +162,9 @@ pub const Scanner = struct {
         return is_alpha(char) or is_digit(char);
     }
 
-    fn push_error(self: *Self, line: u32, col: u32, msg: []const u8) !void {
+    fn add_error(self: *Self, err: Error) !void {
         self.has_error = true;
-        try self.errors.append(ScannerError.init(line, col, msg));
+        try self.errors.append(ErrorDetail{ .line = self.line, .col = self.col, .err = err });
     }
 
     fn at_end(self: Self) bool {
@@ -197,21 +198,13 @@ pub const Scanner = struct {
         return char;
     }
 
-    pub fn scan_tokens(self: *Self) !void {
-        while (!self.at_end()) {
-            self.start = self.current; // start is changing for reading multi-char lexeme
-            try self.scan_token(); // TODO: Handler bubbled errors here, OutOfMemory error return, other scanner error add to error list.
-        }
-        try self.add_token(.EOF);
+    fn add_token_with_literal(self: *Self, token_type: TokenType, literal: ?Literal) !void {
+        const text = self.input[self.start..self.current];
+        try self.tokens.append(Token.init(token_type, text, literal, self.line, self.col));
     }
 
     fn add_token(self: *Self, token_type: TokenType) !void {
         try self.add_token_with_literal(token_type, null);
-    }
-
-    fn add_token_with_literal(self: *Self, token_type: TokenType, literal: ?Literal) !void {
-        const text = self.input[self.start..self.current];
-        try self.tokens.append(Token.init(token_type, text, literal, self.line));
     }
 
     fn string(self: *Self) !void {
@@ -221,7 +214,7 @@ pub const Scanner = struct {
         }
         if (self.at_end()) {
             // Add lexer error "unterminated string"
-            try self.push_error(self.line, self.col, "Unterminated string.");
+            try self.add_error(error.UnterminatedString);
             return;
         }
         _ = self.advance(); // while stops at a char before ", so we shift one position forward
@@ -236,9 +229,9 @@ pub const Scanner = struct {
             while (is_digit(self.peek())) _ = self.advance();
         }
 
-        const parsed_float = std.fmt.parseFloat(f32, self.input[self.start..self.current]) catch {
+        const parsed_float = fmt.parseFloat(f16, self.input[self.start..self.current]) catch {
             // add parse error
-            try self.push_error(self.line, self.col, "Invalid Number.");
+            try self.add_error(error.InvalidNumber);
             return;
         };
         try self.add_token_with_literal(.NUMBER, .{
@@ -289,18 +282,29 @@ pub const Scanner = struct {
             },
             '"' => try self.string(),
             else => {
-                if (is_digit(char)) { // reading numbers
+                if (is_digit(char)) {
                     try self.number();
-                } else if (is_alpha(char)) {
-                    try self.identifier();
-                } else {
-                    // Add lexer error and continue "Unexpeceted Character"
-                    try self.push_error(self.line, self.col, "Unexpected Character");
                     return;
                 }
+
+                if (is_alpha(char)) {
+                    try self.identifier();
+                    return;
+                }
+
+                try self.add_error(error.UnexpectedCharacter);
             },
         }
     }
+
+    pub fn scan_tokens(self: *Self) !void {
+        while (!self.at_end()) {
+            self.start = self.current; // start is changing for reading multi-char lexeme
+            try self.scan_token(); // NOTE: OutOfMemory error returns, other scanner error add to error list.
+        }
+        try self.add_token(.EOF);
+    }
+
     pub fn deinit(self: *Self) void {
         self.keywords.deinit();
         self.tokens.deinit();
@@ -499,4 +503,30 @@ test "Test Scanner" {
     //     std.debug.print("\t    {s}^--Here\n", .{spaces[0 .. err.col - 1]});
     // };
 
+}
+
+test "Scanner Errors" {
+    // Unexpected Character
+    // Unterminated String
+    // Invalid Number
+    const input =
+        \\ a ? b
+        \\ "apple
+    ;
+
+    const errors = [_]Error{
+        Error.UnexpectedCharacter,
+        Error.UnterminatedString,
+    };
+
+    var scanner = try Scanner.init(std.testing.allocator, input);
+    defer scanner.deinit();
+
+    try scanner.scan_tokens();
+
+    try std.testing.expect(scanner.has_error);
+
+    for (scanner.errors.items, 0..) |err, i| {
+        try std.testing.expect(err.err == errors[i]);
+    }
 }

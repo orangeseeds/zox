@@ -12,8 +12,8 @@ const TokenType = scanner.TokenType;
 pub const Error = error{
     UnexpectedToken,
     ParserError,
-    ExpectedToken,
-};
+    ExpectedExpression,
+} || std.mem.Allocator.Error;
 
 pub const DetErr = struct {
     token: Token,
@@ -70,14 +70,19 @@ pub const Parser = struct {
 
     /// check if current token matches any of the given TokenTypes.
     /// if a match is found advance one token forward.
-    fn match(self: *Self, token_types: []const TokenType) bool {
-        for (token_types) |token_type| {
+    fn match_one_of(self: *Self, slice: []const TokenType) bool {
+        for (slice) |token_type| {
             if (self.check(token_type)) {
                 _ = self.advance();
                 return true;
             }
         }
         return false;
+    }
+
+    fn match(self: *Self, token_types: anytype) bool {
+        const arr: [token_types.len]TokenType = token_types;
+        return self.match_one_of(&arr);
     }
 
     /// check if current token matches the given TokenType.
@@ -94,91 +99,137 @@ pub const Parser = struct {
             @panic("Error: Out Of Memory, appending parse error!");
         };
         // TODO: handler error properly
-        // https://craftinginterpreters.com/parsing-expressions.html#Entering panic mode
+        // https://craftinginterpreters.com/parsing-expressions.html#entering-panic-mode
     }
 
     fn primary(self: *Self) Error!Expr {
-        if (self.match(&[_]TokenType{.FALSE})) return Expr{ .Literal = .{ .value = .False } };
-        if (self.match(&[_]TokenType{.TRUE})) return Expr{ .Literal = .{ .value = .True } };
-        if (self.match(&[_]TokenType{.NIL})) return Expr{ .Literal = .{ .value = .Nil } };
+        if (self.match(.{.FALSE})) return Expr{ .Literal = .{ .value = .False } };
+        if (self.match(.{.TRUE})) return Expr{ .Literal = .{ .value = .True } };
+        if (self.match(.{.NIL})) return Expr{ .Literal = .{ .value = .Nil } };
 
-        if (self.match(&[_]TokenType{ .NUMBER, .STRING })) {
-            return Expr{ .Literal = .{ .value = self.previous().literal } }; // TODO: Handle Error Here!
-        }
+        if (self.match(.{ .NUMBER, .STRING })) return Expr{ .Literal = .{ .value = self.previous().literal.? } };
+
+        if (self.match(.{.IDENTIFIER})) return Expr{ .Variable = .{ .name = self.previous() } };
 
         // check if the start is a LEFT_PAREN, read the immediate expr
         // Then expecte the next token to be a RIGHT_PAREN
-        if (self.match(&[_]TokenType{.LEFT_PAREN})) {
-            var expr = try self.expression();
+        if (self.match(.{.LEFT_PAREN})) {
+            const expr = try self.allocator.create(Expr);
+            expr.* = try self.expression();
             _ = try self.consume(.RIGHT_PAREN, "Expected ')' after the expression.");
-            const new_expr = Expr{ .Group = .{ .expression = &expr } };
+            const new_expr = Expr{ .Group = .{ .expression = expr } };
             return new_expr;
         }
 
         self.push_error(self.peek(), "Expect expression.");
-        return error.ExpectedToken;
+        return error.ExpectedExpression;
     }
 
     fn unary(self: *Self) Error!Expr {
-        if (self.match(&[_]TokenType{ .BANG, .MINUS })) {
+        if (self.match(.{ .BANG, .MINUS })) {
             const operator = self.previous();
-            var right_exp = try self.unary();
-            return Expr{ .Unary = .{ .right = &right_exp, .operator = operator } };
+            const right_exp = try self.allocator.create(Expr);
+            right_exp.* = try self.unary();
+            return Expr{ .Unary = .{ .right = right_exp, .operator = operator } };
         }
 
         return try self.primary();
     }
 
     fn factor(self: *Self) Error!Expr {
-        var expr = try self.unary();
+        var expr = try self.allocator.create(Expr);
+        expr.* = try self.unary();
 
-        while (self.match(&[_]TokenType{ .SLASH, .STAR })) {
+        while (self.match(.{ .SLASH, .STAR })) {
             const operator = self.previous();
-            var right = try self.unary();
-            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
-            return new_expr;
+            const right = try self.allocator.create(Expr);
+            right.* = try self.unary();
+            const new_expr = try self.allocator.create(Expr);
+            new_expr.* = Expr{ .Binary = .{ .left = expr, .operator = operator, .right = right } };
+            expr = new_expr;
         }
 
-        return expr;
+        return expr.*;
     }
 
-    fn term(self: *Self) Error!Expr {
-        var expr = try self.factor();
+    fn addition(self: *Self) Error!Expr {
+        var expr = try self.allocator.create(Expr);
+        expr.* = try self.factor();
 
-        while (self.match(&[_]TokenType{ .MINUS, .PLUS })) {
+        while (self.match(.{ .MINUS, .PLUS })) {
             const operator = self.previous();
-            var right = try self.factor();
-            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
-            return new_expr;
+            const right = try self.allocator.create(Expr);
+            right.* = try self.factor();
+            const new_expr = try self.allocator.create(Expr);
+            new_expr.* = Expr{ .Binary = .{ .left = expr, .operator = operator, .right = right } };
+            expr = new_expr;
         }
 
-        return expr;
+        return expr.*;
     }
 
     fn comparison(self: *Self) Error!Expr {
-        var expr = try self.term();
+        var expr = try self.allocator.create(Expr);
+        expr.* = try self.addition();
 
-        while (self.match(&[_]TokenType{ .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL })) {
+        while (self.match(.{ .GREATER, .GREATER_EQUAL, .LESS, .LESS_EQUAL })) {
             const operator = self.previous();
-            var right = try self.term();
-            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
-            return new_expr;
+            const right = try self.allocator.create(Expr);
+            right.* = try self.addition();
+
+            const new_expr = try self.allocator.create(Expr);
+            new_expr.* = Expr{ .Binary = .{ .left = expr, .operator = operator, .right = right } };
+            expr = new_expr;
         }
 
-        return expr;
+        return expr.*;
     }
 
     fn equality(self: *Self) Error!Expr {
-        var expr = try self.comparison();
+        const left = try self.allocator.create(Expr);
+        left.* = try self.comparison();
 
-        while (self.match(&[_]TokenType{ .BANG_EQUAL, .EQUAL_EQUAL })) {
+        while (self.match(.{ .BANG_EQUAL, .EQUAL_EQUAL })) {
             const operator = self.previous();
-            var right = try self.comparison();
-            const new_expr = Expr{ .Binary = .{ .left = &expr, .operator = operator, .right = &right } };
+            const right = try self.allocator.create(Expr);
+            right.* = try self.comparison();
+            const new_expr = Expr{ .Binary = .{ .left = left, .operator = operator, .right = right } };
             return new_expr;
         }
 
-        return expr;
+        return left.*;
+    }
+
+    fn assignment(self: *Self) Error!Expr {
+        // TODO: remaining to write tests for assignment exressions
+        const exp = try self.allocator.create(Expr);
+        exp.* = try self.equality();
+
+        if (self.match(.{.Equal})) {
+            const equal_op = self.previous();
+            const value = try self.allocator.create(Expr);
+            value.* = self.assignment();
+
+            switch (exp.*) {
+                .Variable => |v| {
+                    const name = v.name;
+                    return Expr{ .Assign = .{ .name = name, .value = value } };
+                },
+                else => try self.push_error(equal_op, "Invalid assignment target"),
+            }
+        }
+
+        return exp.*;
+    }
+    fn block(self: *Self) Error!std.ArrayList(Stmt) {
+        var stmts = std.ArrayList(Stmt).init(self.allocator);
+
+        while (!self.check(.RIGHT_BRACE)) {
+            try stmts.append(try self.declaration());
+        }
+
+        _ = self.consume(.RIGHT_BRACE, "Expecte '}' after block.");
+        return stmts;
     }
 
     fn expression(self: *Self) Error!Expr {
@@ -220,21 +271,52 @@ pub const Parser = struct {
     fn print_stmt(self: *Self) !Stmt {
         const val = try self.expression();
         _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
-        return Stmt{ .Print = .{ .expression = val } };
+        return Stmt{ .PrintStmt = val };
     }
     fn expression_stmt(self: *Self) !Stmt {
         const val = try self.expression();
         _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
-        return Stmt{ .Expr = .{ .expression = val } };
+        return Stmt{ .ExprStmt = val };
     }
+    pub fn var_declaration(self: *Self) !Stmt {
+        const name = try self.consume(.IDENTIFIER, "Expect variable name.");
+
+        var initializer: ?Expr = undefined;
+        if (self.match(.{.EQUAL})) {
+            initializer = try self.expression();
+        }
+
+        _ = try self.consume(.SEMICOLON, "Expect ';' after variable declaration.");
+        return Stmt{ .VarStmt = .{ .initializer = initializer, .name = name } };
+    }
+
+    fn declaration(self: *Self) !Stmt {
+        if (self.match(.{.VAR})) {
+            const stmt = try self.allocator.create(Stmt);
+            stmt.* = self.var_declaration() catch |err|
+                switch (err) {
+                Error.OutOfMemory => return err,
+                else => {
+                    self.synchronize();
+                    return error.UnexpectedToken;
+                },
+            };
+            return stmt.*;
+        }
+        return try self.statement();
+    }
+
     fn statement(self: *Self) !Stmt {
-        if (self.match(&[_]TokenType{TokenType.PRINT})) return try self.print_stmt();
+        if (self.match(.{TokenType.PRINT})) return try self.print_stmt();
         return try self.expression_stmt();
     }
 
     pub fn parse_stmts(self: *Self, allocator: std.mem.Allocator) !std.ArrayList(Stmt) {
         var stmts = std.ArrayList(Stmt).init(allocator);
-        while (!self.at_end()) try stmts.append(try self.statement());
+        while (!self.at_end()) {
+            // try stmts.append(try self.statement());
+            try stmts.append(try self.declaration());
+        }
         return stmts;
     }
 };
@@ -245,13 +327,15 @@ test "Testing the Parser" {
     const allocator = arena.allocator();
 
     const input =
-        \\ "apple"==(100 - 10);
+        \\ "apple" == (100 - 10);
     ;
 
     var lexer = try Scanner.init(allocator, input);
+    defer lexer.deinit();
     try lexer.scan_tokens();
 
-    var parser = Parser.init(allocator, lexer.tokens);
+    var parser = Parser.init(allocator, try lexer.tokens.clone());
+    defer parser.deinit();
     const expr = try parser.parse();
 
     // catch |err| {
@@ -266,6 +350,25 @@ test "Testing the Parser" {
     //     };
 
     const got = try expr.to_string(allocator);
-    const expected = "(== apple (group (- 100 10)))";
-    try std.testing.expect(std.mem.eql(u8, got, expected));
+    const expected = "(== \"apple\" (group (- 100 10)))";
+    try std.testing.expect(std.mem.eql(u8, got.items, expected));
+}
+
+test "Parsing Declaration Stmt" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const input =
+        \\ var val = "apple";
+    ;
+
+    var lexer = try Scanner.init(allocator, input);
+    try lexer.scan_tokens();
+
+    var parser = Parser.init(allocator, try lexer.tokens.clone());
+    const stmt = try parser.declaration();
+    const str = try stmt.to_string(allocator);
+    // std.debug.print("\nexpected: {s}, got:{s}\n", .{ input, str.items });
+    try std.testing.expect(std.mem.eql(u8, "var val = \"apple\";", str.items));
 }
