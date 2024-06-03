@@ -10,6 +10,7 @@ pub const GroupExpr = struct { expression: *Expr };
 pub const LiteralExpr = struct { value: ?Literal };
 pub const VariableExpr = struct { name: Token };
 pub const AssignExpr = struct { name: Token, value: *Expr };
+pub const LogicalExpr = struct { left: *Expr, operator: Token, right: *Expr };
 
 pub const Expr = union(enum) {
     const Self = @This();
@@ -19,6 +20,7 @@ pub const Expr = union(enum) {
     Literal: LiteralExpr,
     Variable: VariableExpr,
     Assign: AssignExpr,
+    Logical: LogicalExpr,
 
     fn parenthesize_recur(self: Self, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), expr: Expr) !void {
         // std.debug.print("Test: {any}\n", .{expr});
@@ -63,6 +65,13 @@ pub const Expr = union(enum) {
                 try self.parenthesize_recur(allocator, buff, asgn.value.*);
                 try buff.append(')');
             },
+            .Logical => |log| {
+                try buff.writer().print("({s} ", .{log.operator.lexeme});
+                try self.parenthesize_recur(allocator, buff, log.left.*);
+                try buff.append(' ');
+                try self.parenthesize_recur(allocator, buff, log.right.*);
+                try buff.append(')');
+            },
         }
     }
 
@@ -73,17 +82,23 @@ pub const Expr = union(enum) {
     }
 };
 
+const Error = std.mem.Allocator.Error;
+
 pub const PrintStmt = Expr;
 pub const ExprStmt = Expr;
 pub const VarStmt = struct { name: Token, initializer: ?Expr };
 pub const BlockStmt = std.ArrayList(Stmt);
+pub const IfStmt = struct { condition: Expr, then_br: *Stmt, else_br: ?*Stmt };
+pub const WhileStmt = struct { condition: Expr, body: *Stmt };
 pub const Stmt = union(enum) {
     PrintStmt: Expr,
     ExprStmt: Expr,
     VarStmt: VarStmt,
     BlockStmt: BlockStmt,
+    IfStmt: IfStmt,
+    WhileStmt: WhileStmt,
 
-    fn parenthesize_recur(self: Stmt, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), stmt: Stmt) !void {
+    fn parenthesize_recur(self: Stmt, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), stmt: Stmt) Error!void {
         // std.debug.print("Test: {any}\n", .{expr});
         switch (stmt) {
             .PrintStmt => |print| {
@@ -105,9 +120,27 @@ pub const Stmt = union(enum) {
                 }
                 try buff.append('}');
             },
+            .IfStmt => |i| {
+                const condition = try i.condition.to_string(allocator);
+                try buff.writer().print("if {s}", .{condition.items});
+
+                const then = try i.then_br.to_string(allocator);
+                try buff.writer().print("{s}", .{then.items});
+                if (i.else_br) |el| {
+                    const el_str = try el.to_string(allocator);
+                    try buff.writer().print("{s}", .{el_str.items});
+                }
+            },
+            .WhileStmt => |w| {
+                const condition = try w.condition.to_string(allocator);
+                try buff.writer().print("if {s}", .{condition.items});
+
+                const body = try w.body.to_string(allocator);
+                try buff.writer().print("{s}", .{body.items});
+            },
         }
     }
-    pub fn to_string(self: Stmt, allocator: std.mem.Allocator) !std.ArrayList(u8) {
+    pub fn to_string(self: Stmt, allocator: std.mem.Allocator) Error!std.ArrayList(u8) {
         var buff = std.ArrayList(u8).init(allocator);
         try self.parenthesize_recur(allocator, &buff, self);
         return buff;

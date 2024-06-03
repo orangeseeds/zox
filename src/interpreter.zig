@@ -16,12 +16,15 @@ const BinaryExpr = expr.BinaryExpr;
 const GroupExpr = expr.GroupExpr;
 const AssignExpr = expr.AssignExpr;
 const VariableExpr = expr.VariableExpr;
+const LogicalExpr = expr.LogicalExpr;
 
 const Stmt = expr.Stmt;
 const ExprStmt = expr.ExprStmt;
 const PrintStmt = expr.PrintStmt;
 const VarStmt = expr.VarStmt;
 const BlockStmt = expr.BlockStmt;
+const IfStmt = expr.IfStmt;
+const WhileStmt = expr.WhileStmt;
 
 const Token = scanner.Token;
 
@@ -249,8 +252,21 @@ pub const Interpreter = struct {
         };
     }
 
+    // print "hi" or 2; // "hi".
+    // print nil or "yes"; // "yes".
+    fn eval_logical_expr(self: *Self, e: LogicalExpr) RuntimeError!Value {
+        // TODO: Test logical expression
+        const left = try self.evaluate_expr(e.left.*);
+
+        switch (e.operator.token_type) {
+            .OR => if (left.is_truthy()) return left,
+            else => if (!left.is_truthy()) return left,
+        }
+
+        return try self.evaluate_expr(e.right.*);
+    }
+
     fn eval_block(self: *Self, stmts: std.ArrayList(Stmt), envr: Environment) RuntimeError!void {
-        // TODO: write tests for block
         const prev = self.environment;
 
         self.environment = envr;
@@ -281,10 +297,29 @@ pub const Interpreter = struct {
         }
         try self.environment.define(e.name.lexeme, val);
     }
+
     fn eval_block_stmt(self: *Self, stmt: BlockStmt) RuntimeError!void {
         const enclosing = try self.allocator.create(Environment);
         enclosing.* = self.environment;
         try self.eval_block(stmt, Environment.with_enclosing(self.allocator, enclosing));
+    }
+
+    fn eval_if_stmt(self: *Self, stmt: IfStmt) !void {
+        var condition = try self.evaluate_expr(stmt.condition);
+        if (condition.is_truthy()) {
+            try self.evaluate_stmt(stmt.then_br.*);
+            return;
+        }
+        if (stmt.else_br) |e| {
+            try self.evaluate_stmt(e.*);
+            return;
+        }
+    }
+
+    fn eval_while_stmt(self: *Self, stmt: WhileStmt) !void {
+        while ((try self.evaluate_expr(stmt.condition)).is_truthy()) {
+            self.evaluate_stmt(stmt.body);
+        }
     }
 
     fn evaluate_stmt(self: *Self, stmt: Stmt) RuntimeError!void {
@@ -293,9 +328,37 @@ pub const Interpreter = struct {
             .ExprStmt => |e| _ = try self.eval_expr_stmt(e),
             .VarStmt => |v| try self.eval_var_stmt(v),
             .BlockStmt => |b| try self.eval_block_stmt(b),
+            .IfStmt => |i| try self.eval_if_stmt(i),
+            .WhileStmt => |w| try self.eval_while_stmt(w),
         }
     }
 };
+
+test "If Statement" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const src =
+        \\ if (10 != 10){ 10; } else { 20; }
+    ;
+
+    var lexer = try scanner.Scanner.init(allocator, src);
+    try lexer.scan_tokens();
+
+    var par = parser.Parser.init(allocator, try lexer.tokens.clone());
+
+    const stmts = par.parse_stmts(allocator) catch {
+        std.debug.print("\n{s}\n", .{par.errors.items[0].message});
+        return;
+    };
+    // std.debug.print("{s}", .{(try stmts.items[0].to_string(allocator)).items});
+
+    var interpreter = Interpreter.init(allocator);
+    for (stmts.items) |stmt| {
+        try interpreter.evaluate_stmt(stmt);
+    }
+}
 
 test "Block Statement" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
