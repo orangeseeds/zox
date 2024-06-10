@@ -32,6 +32,8 @@ pub const Environment = struct {
     }
 
     pub fn get(self: *Self, name: []const u8) EnvError!Value {
+        // BUG: no address available when key search err, should return
+        // NotDeclaredAndUndefined but returns no address available.
         if (self.values.getKey(name)) |key| {
             if (self.values.get(key)) |val| return val orelse
                 error.DeclaredButUndefined;

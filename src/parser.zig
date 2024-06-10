@@ -13,6 +13,9 @@ pub const Error = error{
     UnexpectedToken,
     ParserError,
     ExpectedExpression,
+    InvalidAssignmentTarget,
+    ExceededMaxNumArgs,
+    ParameterNumExceeded,
 } || std.mem.Allocator.Error;
 
 pub const DetErr = struct {
@@ -39,6 +42,18 @@ pub const Parser = struct {
             .allocator = allocator,
             .errors = std.ArrayList(DetErr).init(allocator),
         };
+    }
+
+    pub fn get_errors(self: *Self) ![][]u8 {
+        var v_errs = std.ArrayList([]u8).init(self.allocator);
+        for (self.errors.items) |err| {
+            try v_errs.append(try std.fmt.allocPrint(self.allocator, "{s} at line={d},col={d}", .{
+                err.message,
+                err.token.line_num,
+                err.token.col,
+            }));
+        }
+        return v_errs.items;
     }
 
     /// peek at current token
@@ -125,6 +140,42 @@ pub const Parser = struct {
         return error.ExpectedExpression;
     }
 
+    fn finish_call(self: *Self, callee: Expr) Error!Expr {
+        var args = std.ArrayList(Expr).init(self.allocator);
+        if (!self.check(.RIGHT_PAREN)) {
+            while (true) { // basically do while.
+                if (args.items.len >= 255) {
+                    self.push_error(self.peek(), "Number of arguements in the function call exeeded max amount.");
+                    return error.ExceededMaxNumArgs;
+                }
+                try args.append(try self.expression());
+
+                if (!self.match(.{.COMMA})) break;
+            }
+        }
+
+        const paren = try self.consume(.RIGHT_PAREN, "expect ')' after arguments");
+        const expr = try self.allocator.create(Expr);
+        expr.* = callee;
+        return Expr{ .Call = .{ .callee = expr, .paren = paren, .args = args } };
+    }
+
+    fn call(self: *Self) Error!Expr {
+        const expr = try self.allocator.create(Expr);
+        expr.* = try self.primary();
+
+        const curr: *Expr = expr;
+        while (true) {
+            // TODO: check alloc after free
+            if (!self.match(.{.LEFT_PAREN})) break;
+            const new = try self.allocator.create(Expr);
+            new.* = try self.finish_call(expr.*);
+            curr.* = new.*;
+        }
+
+        return expr.*;
+    }
+
     fn unary(self: *Self) Error!Expr {
         if (self.match(.{ .BANG, .MINUS })) {
             const operator = self.previous();
@@ -133,7 +184,7 @@ pub const Parser = struct {
             return Expr{ .Unary = .{ .right = right_exp, .operator = operator } };
         }
 
-        return try self.primary();
+        return try self.call();
     }
 
     fn factor(self: *Self) Error!Expr {
@@ -200,7 +251,7 @@ pub const Parser = struct {
         return left.*;
     }
 
-    fn parse_and(self: *Self) Error!Expr {
+    fn and_expr(self: *Self) Error!Expr {
         const exp = try self.allocator.create(Expr);
         exp.* = try self.equality();
 
@@ -212,14 +263,14 @@ pub const Parser = struct {
         return exp.*;
     }
 
-    fn parse_or(self: *Self) Error!Expr {
+    fn or_expr(self: *Self) Error!Expr {
         const exp = try self.allocator.create(Expr);
         exp.* = try self.equality();
 
         while (self.match(.{.OR})) {
             const operator = try self.previous();
-            const and_expr = self.parse_and();
-            exp.* = Expr{ .Logical = .{ .left = exp, .operator = operator, .right = and_expr } };
+            const and_e = self.and_expr();
+            exp.* = Expr{ .Logical = .{ .left = exp, .operator = operator, .right = and_e } };
         }
         return exp.*;
     }
@@ -229,17 +280,20 @@ pub const Parser = struct {
         const exp = try self.allocator.create(Expr);
         exp.* = try self.equality();
 
-        if (self.match(.{.Equal})) {
+        if (self.match(.{.EQUAL})) {
             const equal_op = self.previous();
             const value = try self.allocator.create(Expr);
-            value.* = self.assignment();
+            value.* = try self.assignment();
 
             switch (exp.*) {
                 .Variable => |v| {
                     const name = v.name;
                     return Expr{ .Assign = .{ .name = name, .value = value } };
                 },
-                else => try self.push_error(equal_op, "Invalid assignment target"),
+                else => {
+                    self.push_error(equal_op, "Invalid assignment target");
+                    return error.InvalidAssignmentTarget;
+                },
             }
         }
 
@@ -258,7 +312,7 @@ pub const Parser = struct {
     }
 
     fn expression(self: *Self) Error!Expr {
-        return try self.equality();
+        return try self.assignment();
     }
 
     fn synchronize(self: *Self) void {
@@ -291,8 +345,8 @@ pub const Parser = struct {
         self.errors.deinit();
     }
 
-    /// Handling Statements
-    ///
+    // Handling Statements -------------------------------------------------
+
     fn print_stmt(self: *Self) Error!Stmt {
         const val = try self.expression();
         _ = try self.consume(TokenType.SEMICOLON, "Expect ';' after value.");
@@ -333,7 +387,7 @@ pub const Parser = struct {
 
     // parsing if statements
     // since else is optional, if () if() else(), can be parsed in two ways.
-    // we parse using he nearest if to the else
+    // we parse using the nearest if to the else
     fn if_stmt(self: *Self) Error!Stmt {
         _ = try self.consume(.LEFT_PAREN, "Expected '(' after 'if'.");
         const condition = try self.expression();
@@ -342,21 +396,16 @@ pub const Parser = struct {
         const then_branch = try self.allocator.create(Stmt);
         then_branch.* = try self.parse_stmt();
 
+        var else_branch: ?*Stmt = null;
         if (self.match(.{.ELSE})) {
-            const else_branch = try self.allocator.create(Stmt);
-            else_branch.* = try self.parse_stmt();
-
-            return Stmt{ .IfStmt = .{
-                .condition = condition,
-                .then_br = then_branch,
-                .else_br = else_branch,
-            } };
+            else_branch = try self.allocator.create(Stmt);
+            else_branch.?.* = try self.parse_stmt();
         }
 
         return Stmt{ .IfStmt = .{
             .condition = condition,
             .then_br = then_branch,
-            .else_br = null,
+            .else_br = else_branch,
         } };
     }
 
@@ -371,12 +420,12 @@ pub const Parser = struct {
         return Stmt{ .WhileStmt = .{ .condition = condition, .body = body } };
     }
 
-    // TODO: Write tests for for statement
     fn for_stmt(self: *Self) Error!Stmt {
+        _ = try self.consume(.LEFT_PAREN, "Expected '(' after for.");
         // Initializer
         var initializer: ?Stmt = null;
         if (self.match(.{.SEMICOLON}))
-            initializer = undefined
+            initializer = null
         else if (self.match(.{.VAR}))
             initializer = try self.var_decl_stmt()
         else
@@ -384,13 +433,13 @@ pub const Parser = struct {
 
         // Condition
         var condition: ?Expr = null;
-        if (self.match(.{.SEMICOLON})) condition = try self.expression();
+        if (!self.match(.{.SEMICOLON})) condition = try self.expression();
 
         _ = try self.consume(.SEMICOLON, "Expected ';' after for loop condition.");
 
         // Increment
         var increment: ?Expr = null;
-        if (self.match(.{.SEMICOLON})) increment = try self.expression();
+        if (!self.check(.RIGHT_PAREN)) increment = try self.expression();
 
         _ = try self.consume(.RIGHT_PAREN, "Expected ')' to close the for clause.");
 
@@ -398,28 +447,68 @@ pub const Parser = struct {
         const body = try self.allocator.create(Stmt);
         body.* = try self.parse_stmt();
 
-        // Desugaring for loop into a while loop
+        // Desugaring for loop into a while loop ------
+        const with_incr = try self.allocator.create(Stmt);
         if (increment) |val| {
             var new_body = std.ArrayList(Stmt).init(self.allocator);
+            try new_body.append(body.*);
             try new_body.append(Stmt{ .ExprStmt = val });
-            body.* = Stmt{ .BlockStmt = new_body };
+            with_incr.* = Stmt{ .BlockStmt = new_body };
         }
 
         if (condition == null) {
             condition = Expr{ .Literal = .{ .value = .True } };
         }
-        body.* = Stmt{ .WhileStmt = .{ .condition = condition.?, .body = body } };
 
-        if (initializer) |_| {
+        const desug_while = Stmt{ .WhileStmt = .{ .condition = condition.?, .body = with_incr } };
+        var with_decl = desug_while;
+        if (initializer) |val| {
             var new_body = std.ArrayList(Stmt).init(self.allocator);
-            try new_body.append(body.*);
-            body.* = Stmt{ .BlockStmt = new_body };
+            try new_body.append(val);
+            try new_body.append(desug_while);
+            with_decl = Stmt{ .BlockStmt = new_body };
         }
 
-        return body.*;
+        return with_decl;
+    }
+
+    fn fun_stmt(self: *Self, kind: []const u8) Error!Stmt {
+        // TODO: test fun stmt parsing
+        const name = try self.consume(
+            .IDENTIFIER,
+            try std.fmt.allocPrint(self.allocator, "Expect {s} name.", .{kind}),
+        );
+
+        _ = try self.consume(
+            .LEFT_PAREN,
+            try std.fmt.allocPrint(self.allocator, "Expect '(' after {s} name.", .{kind}),
+        );
+
+        var parameters = std.ArrayList(Token).init(self.allocator);
+        if (!self.check(.RIGHT_PAREN)) {
+            while (true) {
+                if (parameters.items.len >= 255) {
+                    self.push_error(self.peek(), "Can't have more than 255 parameters.");
+                    return error.ParameterNumExceeded;
+                }
+                try parameters.append(try self.consume(.IDENTIFIER, "Expect parameter name."));
+
+                if (!self.match(.{.COMMA})) break;
+            }
+        }
+        _ = try self.consume(.RIGHT_PAREN, "Expect ')' after parameters.");
+
+        _ = try self.consume(
+            .LEFT_BRACE,
+            try std.fmt.allocPrint(self.allocator, "Expect LEFT_BRACE before {s} body.", .{kind}),
+        );
+
+        const body = try self.block();
+        return Stmt{ .FuncStmt = .{ .name = name, .params = parameters, .body = body } };
     }
 
     fn parse_stmt(self: *Self) Error!Stmt {
+        if (self.match(.{.FUN})) return self.fun_stmt("function");
         if (self.match(.{.FOR})) return self.for_stmt();
         if (self.match(.{.IF})) return try self.if_stmt();
         if (self.match(.{.PRINT})) return try self.print_stmt();
@@ -438,92 +527,53 @@ pub const Parser = struct {
     }
 };
 
-test "Parse Print Stmt" {
+fn print_verbose_err(case: []const u8, errs: []DetErr) void {
+    std.debug.print("\n", .{});
+    for (errs) |err| {
+        std.debug.print("{s}: {s} at line={d},col={d}", .{
+            case,
+            err.message,
+            err.token.line_num,
+            err.token.col,
+        });
+    }
+    std.debug.print("\n", .{});
+}
+
+test "Test Parser" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const str = []const u8;
-    const cases = [_]str{
-        "print (102 + 20);",
-        "print (apple);",
+    const cases = [_]struct { []const u8, []const u8 }{ // case, expected
+        .{ "10 * 10 + 10 / 10;", "(+ (* 10 10) (/ 10 10));" },
+
+        .{ "var apple = 10;", "var apple = 10;" },
+
+        .{ "print (10);", "print ( (group 10) );" },
+
+        .{ "if (true) if (false) 10; else 20;", "if (true) { if (false) { 10; } else { 20; } }" },
+
+        .{ "while (true) print(10);", "while (true) { print ( (group 10) ); }" },
+
+        .{ "for ( var i = 10 ; i < 10 ; i = i + 1 ) print 10;", "{var i = 10;while ((< (var i ) 10)) { {print ( 10 );(i = (+ (var i ) 1));} }}" },
+
+        .{ "caller( apple, ball, cat );", "( call (var caller )((var apple ), (var ball ), (var cat )));" },
+
+        .{ "fun new(x,y){ x+y; }", "func new( x, y ){(+ (var x ) (var y ));}" },
     };
 
     for (cases) |case| {
-        var lexer = try Scanner.init(alloc, case);
+        var lexer = try Scanner.init(alloc, case[0]);
         try lexer.scan_tokens();
         var parser = Parser.init(alloc, try lexer.tokens.clone());
-        const stmt = parser.parse_stmt() catch {
-            std.debug.print("\n", .{});
-            for (parser.errors.items) |err| {
-                std.debug.print("{s}: {s} at line={d},col={d}", .{
-                    case,
-                    err.message,
-                    err.token.line_num,
-                    err.token.col,
-                });
-            }
-            std.debug.print("\n", .{});
+        const stmts = parser.parse_stmts(alloc) catch {
+            for (try parser.get_errors()) |value|
+                std.debug.print("\ncase: {s}, {s}\n", .{ case[0], value });
+
             try std.testing.expect(false);
             return;
         };
-        _ = stmt; // autofix
+        try std.testing.expectEqualStrings(case[1], (try stmts.getLastOrNull().?.to_string(alloc)).items);
     }
-}
-test "Parse Expr Stmt" {}
-test "Parse Var Declaration" {}
-test "Parse If Stmt" {}
-test "Parse While Stmt" {}
-test "Parse For Stmt" {}
-
-test "Testing the Parser" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const input =
-        \\ "apple" == (100 - 10);
-    ;
-
-    var lexer = try Scanner.init(allocator, input);
-    defer lexer.deinit();
-    try lexer.scan_tokens();
-
-    var parser = Parser.init(allocator, try lexer.tokens.clone());
-    defer parser.deinit();
-    const expr = try parser.parse();
-
-    // catch |err| {
-    //         switch (err) {
-    //             Error.ParserError => std.debug.print("\nParse Error!\n", .{}),
-    //             Error.UnexpectedToken => std.debug.print("\nUnexpeceted Token!\n", .{}),
-    //             Error.ExpectedToken => std.debug.print("\nExpected Token!\n", .{}),
-    //         }
-    //
-    //         std.debug.print("{s}", .{parser.errors.getLast().message});
-    //         return;
-    //     };
-
-    const got = try expr.to_string(allocator);
-    const expected = "(== \"apple\" (group (- 100 10)))";
-    try std.testing.expect(std.mem.eql(u8, got.items, expected));
-}
-
-test "Parsing Declaration Stmt" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const input =
-        \\ var val = "apple";
-    ;
-
-    var lexer = try Scanner.init(allocator, input);
-    try lexer.scan_tokens();
-
-    var parser = Parser.init(allocator, try lexer.tokens.clone());
-    const stmt = try parser.declaration();
-    const str = try stmt.to_string(allocator);
-    // std.debug.print("\nexpected: {s}, got:{s}\n", .{ input, str.items });
-    try std.testing.expect(std.mem.eql(u8, "var val = \"apple\";", str.items));
 }

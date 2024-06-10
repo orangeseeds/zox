@@ -11,6 +11,7 @@ pub const LiteralExpr = struct { value: ?Literal };
 pub const VariableExpr = struct { name: Token };
 pub const AssignExpr = struct { name: Token, value: *Expr };
 pub const LogicalExpr = struct { left: *Expr, operator: Token, right: *Expr };
+pub const CallExpr = struct { callee: *Expr, paren: Token, args: std.ArrayList(Expr) };
 
 pub const Expr = union(enum) {
     const Self = @This();
@@ -21,6 +22,7 @@ pub const Expr = union(enum) {
     Variable: VariableExpr,
     Assign: AssignExpr,
     Logical: LogicalExpr,
+    Call: CallExpr,
 
     fn parenthesize_recur(self: Self, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), expr: Expr) !void {
         // std.debug.print("Test: {any}\n", .{expr});
@@ -31,8 +33,8 @@ pub const Expr = union(enum) {
                     switch (value) {
                         .Number => |val| try buff.writer().print("{d}", .{val}),
                         .String => |val| try buff.writer().print("\"{s}\"", .{val}),
-                        .True => |val| try buff.writer().print("{?}", .{val}),
-                        .False => |val| try buff.writer().print("{?}", .{val}),
+                        .True => try buff.writer().print("true", .{}),
+                        .False => try buff.writer().print("false", .{}),
                         .Nil => try buff.appendSlice("nil"),
                     }
                 }
@@ -72,10 +74,20 @@ pub const Expr = union(enum) {
                 try self.parenthesize_recur(allocator, buff, log.right.*);
                 try buff.append(')');
             },
+            .Call => |f| {
+                try buff.writer().print("( call {s}", .{(try f.callee.to_string(allocator)).items});
+                try buff.append('(');
+                for (f.args.items, 0..f.args.items.len) |e, idx| {
+                    try self.parenthesize_recur(allocator, buff, e);
+                    if (idx < f.args.items.len - 1) try buff.writer().print(", ", .{});
+                }
+                try buff.append(')');
+                try buff.append(')');
+            },
         }
     }
 
-    pub fn to_string(self: Self, allocator: std.mem.Allocator) !std.ArrayList(u8) {
+    pub fn to_string(self: Self, allocator: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(u8) {
         var buff = std.ArrayList(u8).init(allocator);
         try self.parenthesize_recur(allocator, &buff, self);
         return buff;
@@ -90,6 +102,7 @@ pub const VarStmt = struct { name: Token, initializer: ?Expr };
 pub const BlockStmt = std.ArrayList(Stmt);
 pub const IfStmt = struct { condition: Expr, then_br: *Stmt, else_br: ?*Stmt };
 pub const WhileStmt = struct { condition: Expr, body: *Stmt };
+pub const FuncStmt = struct { name: Token, params: std.ArrayList(Token), body: std.ArrayList(Stmt) };
 pub const Stmt = union(enum) {
     PrintStmt: Expr,
     ExprStmt: Expr,
@@ -97,13 +110,14 @@ pub const Stmt = union(enum) {
     BlockStmt: BlockStmt,
     IfStmt: IfStmt,
     WhileStmt: WhileStmt,
+    FuncStmt: FuncStmt,
 
     fn parenthesize_recur(self: Stmt, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), stmt: Stmt) Error!void {
         // std.debug.print("Test: {any}\n", .{expr});
         switch (stmt) {
             .PrintStmt => |print| {
                 const str = try print.to_string(allocator);
-                try buff.writer().print("print {s};", .{str.items});
+                try buff.writer().print("print ( {s} );", .{str.items});
             },
             .ExprStmt => |expr| {
                 const str = try expr.to_string(allocator);
@@ -115,28 +129,40 @@ pub const Stmt = union(enum) {
             },
             .BlockStmt => |blk| {
                 try buff.append('{');
-                for (blk.items) |value| {
+                for (blk.items) |value|
                     try self.parenthesize_recur(allocator, buff, value);
-                }
                 try buff.append('}');
             },
             .IfStmt => |i| {
                 const condition = try i.condition.to_string(allocator);
-                try buff.writer().print("if {s}", .{condition.items});
+                try buff.writer().print("if ({s}) ", .{condition.items});
 
                 const then = try i.then_br.to_string(allocator);
-                try buff.writer().print("{s}", .{then.items});
+                try buff.writer().print("{s} {s} {s}", .{ "{", then.items, "}" });
                 if (i.else_br) |el| {
                     const el_str = try el.to_string(allocator);
-                    try buff.writer().print("{s}", .{el_str.items});
+                    try buff.writer().print(" else {s} {s} {s}", .{ "{", el_str.items, "}" });
                 }
             },
             .WhileStmt => |w| {
                 const condition = try w.condition.to_string(allocator);
-                try buff.writer().print("if {s}", .{condition.items});
+                try buff.writer().print("while ({s}) ", .{condition.items});
 
                 const body = try w.body.to_string(allocator);
-                try buff.writer().print("{s}", .{body.items});
+                try buff.writer().print("{s} {s} {s}", .{ "{", body.items, "}" });
+            },
+            .FuncStmt => |fnc| {
+                try buff.writer().print("func {s}( ", .{fnc.name.lexeme});
+                for (fnc.params.items, 0..) |value, i| {
+                    _ = try buff.writer().write(value.lexeme);
+
+                    if (i < fnc.params.items.len - 1) {
+                        _ = try buff.writer().write(", ");
+                    }
+                }
+                _ = try buff.writer().write(" )");
+
+                try self.parenthesize_recur(allocator, buff, Stmt{ .BlockStmt = fnc.body });
             },
         }
     }
