@@ -256,8 +256,9 @@ pub const Parser = struct {
         exp.* = try self.equality();
 
         while (self.match(.{.AND})) {
-            const operator = try self.previous();
-            const right = self.equality();
+            const operator = self.previous();
+            const right = try self.allocator.create(Expr);
+            right.* = try self.equality();
             exp.* = Expr{ .Logical = .{ .left = exp, .operator = operator, .right = right } };
         }
         return exp.*;
@@ -267,10 +268,15 @@ pub const Parser = struct {
         const exp = try self.allocator.create(Expr);
         exp.* = try self.equality();
 
-        while (self.match(.{.OR})) {
-            const operator = try self.previous();
-            const and_e = self.and_expr();
-            exp.* = Expr{ .Logical = .{ .left = exp, .operator = operator, .right = and_e } };
+        const curr: *Expr = exp;
+        while (true) {
+            if (!self.match(.{.OR})) break;
+            const new = try self.allocator.create(Expr);
+            const operator = self.previous();
+            const new_and = try self.allocator.create(Expr);
+            new_and.* = try self.and_expr();
+            new.* = Expr{ .Logical = .{ .left = exp, .operator = operator, .right = new_and } };
+            curr.* = new.*;
         }
         return exp.*;
     }
@@ -299,6 +305,7 @@ pub const Parser = struct {
 
         return exp.*;
     }
+
     fn block(self: *Self) Error!std.ArrayList(Stmt) {
         var stmts = std.ArrayList(Stmt).init(self.allocator);
 
@@ -507,11 +514,23 @@ pub const Parser = struct {
         return Stmt{ .FuncStmt = .{ .name = name, .params = parameters, .body = body } };
     }
 
+    fn return_stmt(self: *Self) Error!Stmt {
+        const keyword = self.previous();
+        var value: ?Expr = null;
+        if (!self.check(.SEMICOLON)) {
+            value = try self.expression();
+        }
+
+        _ = try self.consume(.SEMICOLON, "Expected ';' after return value.");
+        return Stmt{ .ReturnStmt = .{ .keyword = keyword, .expression = value } };
+    }
+
     fn parse_stmt(self: *Self) Error!Stmt {
         if (self.match(.{.FUN})) return self.fun_stmt("function");
         if (self.match(.{.FOR})) return self.for_stmt();
         if (self.match(.{.IF})) return try self.if_stmt();
         if (self.match(.{.PRINT})) return try self.print_stmt();
+        if (self.match(.{.RETURN})) return try self.return_stmt();
         if (self.match(.{.WHILE})) return try self.while_stmt();
         if (self.match(.{.LEFT_BRACE})) return Stmt{ .BlockStmt = try self.block() };
         return try self.expr_stmt();
@@ -561,6 +580,12 @@ test "Test Parser" {
         .{ "caller( apple, ball, cat );", "( call (var caller )((var apple ), (var ball ), (var cat )));" },
 
         .{ "fun new(x,y){ x+y; }", "func new( x, y ){(+ (var x ) (var y ));}" },
+
+        // .{ "{ apple; };", "" },
+
+        .{ "return;", "return;" },
+        .{ "return 10;", "return 10;" },
+        .{ "return apple;", "return (var apple );" },
     };
 
     for (cases) |case| {

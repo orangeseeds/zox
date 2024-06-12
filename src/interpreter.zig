@@ -4,41 +4,13 @@ const parser = @import("parser.zig");
 const env = @import("environment.zig");
 const scanner = @import("scanner.zig");
 const callable = @import("callable.zig");
-const Callable = callable.Callable;
-
-const Parser = parser.Parser;
-const Scanner = scanner.Scanner;
+const testing = std.testing;
 
 const Allocator = std.mem.Allocator;
 
-const Expr = expr.Expr;
-const LiteralExpr = expr.LiteralExpr;
-const UnaryExpr = expr.UnaryExpr;
-const BinaryExpr = expr.BinaryExpr;
-const GroupExpr = expr.GroupExpr;
-const AssignExpr = expr.AssignExpr;
-const VariableExpr = expr.VariableExpr;
-const LogicalExpr = expr.LogicalExpr;
-
-const Stmt = expr.Stmt;
-const ExprStmt = expr.ExprStmt;
-const PrintStmt = expr.PrintStmt;
-const VarStmt = expr.VarStmt;
-const BlockStmt = expr.BlockStmt;
-const IfStmt = expr.IfStmt;
-const WhileStmt = expr.WhileStmt;
-const FuncStmt = expr.FuncStmt;
-
-const Token = scanner.Token;
-
-const Literal = scanner.Literal;
-const TokenType = scanner.TokenType;
-const Environment = env.Environment;
-const EnvError = env.EnvError;
-
 pub const RuntimeError = error{
-    BinaryOperandMismatch,
-    UnaryOperandMismatch,
+    BinaryOperandTypeMismatch,
+    UnaryOperandTypeMismatch,
     IllegalOperator,
     UndefinedVar,
     InvalidCallAttempt,
@@ -58,7 +30,7 @@ pub const Value = union(ValueType) {
     Number: f64,
     String: []const u8,
     Bool: bool,
-    Func: Callable,
+    Func: callable.Callable,
     Nil,
 
     pub fn equal(self: Value, other: Value) bool {
@@ -97,49 +69,29 @@ fn check_op_types(expected: ValueType, left: Value, right: Value) bool {
     return check_op_type(expected, left) and check_op_type(expected, right);
 }
 
-fn def_clock_native_fun() Callable {
-    const clock_native = struct {
-        const Self = @This();
-
-        fn arity(_: *anyopaque) usize {
-            return 0;
-        }
-
-        fn call(_: *anyopaque, _: *Interpreter, _: []Value) RuntimeError!Value {
-            return Value{ .Number = @floatFromInt(std.time.nanoTimestamp()) };
-        }
-
-        fn callable(self: *Self) Callable {
-            return Callable{
-                .ptr = self,
-                .call_func = call,
-                .arity_func = arity,
-            };
-        }
-    };
-    var clock = clock_native{};
-    return clock.callable();
-}
-
 pub const Interpreter = struct {
     const Self = @This();
     const Error = struct {
         err: RuntimeError,
         message: []const u8,
-        token: Token,
+        token: scanner.Token,
     };
 
+    pub const CallStackEntry = struct { id: u64, name: []const u8 };
+    /// id=0 is for starting script
+    id_counter: u64 = 0,
     allocator: Allocator,
-    runtime_error: Error = .{ .err = undefined, .token = undefined, .message = undefined },
-    has_error: bool = false,
-    globals: Environment,
-    environment: Environment,
+    runtime_error: ?Error,
+    globals: env.Environment,
+    environment: env.Environment,
+    callstack: std.ArrayList(CallStackEntry),
+    return_val: ?Value = null,
 
     fn init(allocator: Allocator) Self {
-        var globals = Environment.init(allocator);
+        var globals = env.Environment.init(allocator);
 
-        const call_func = def_clock_native_fun();
-        globals.define("clock", Value{ .Func = call_func }) catch {
+        const clock = callable.def_clock();
+        globals.define("clock", Value{ .Func = clock }) catch {
             @panic("Error defining native functions.");
         };
 
@@ -148,14 +100,20 @@ pub const Interpreter = struct {
             .allocator = allocator,
             .globals = globals,
             .environment = globals,
+            .callstack = std.ArrayList(CallStackEntry).init(allocator),
+            .runtime_error = null,
         };
+    }
+
+    fn get_new_id(self: *Self) u64 {
+        self.id_counter = self.id_counter + 1;
+        return self.id_counter;
     }
     fn deinit(self: *Self) void {
         try self.environment.deinit();
     }
 
-    fn raise_err(self: *Self, err: RuntimeError, token: Token, comptime fmt: []const u8, args: anytype) RuntimeError!void {
-        self.has_error = true;
+    fn raise_err(self: *Self, err: RuntimeError, token: scanner.Token, comptime fmt: []const u8, args: anytype) RuntimeError!void {
         self.runtime_error = .{
             .err = err,
             .message = try std.fmt.allocPrint(self.allocator, fmt, args),
@@ -164,7 +122,7 @@ pub const Interpreter = struct {
         return err;
     }
 
-    fn evaluate_literal(e: LiteralExpr) Value {
+    fn interpret_literal(e: expr.LiteralExpr) Value {
         if (e.value) |val| {
             return switch (val) {
                 .String => |str| Value{ .String = str },
@@ -177,14 +135,14 @@ pub const Interpreter = struct {
         unreachable;
     }
 
-    fn evaluate_unary(self: *Self, e: UnaryExpr) RuntimeError!Value {
-        const right = try self.evaluate_expr(e.right.*);
+    fn interpret_unary(self: *Self, e: expr.UnaryExpr) RuntimeError!Value {
+        const right = try self.interpret_expr(e.right.*);
 
         switch (e.operator.token_type) {
             .MINUS => {
                 if (!check_op_type(.Number, right)) {
                     try self.raise_err(
-                        error.UnaryOperandMismatch,
+                        error.UnaryOperandTypeMismatch,
                         e.operator,
                         "invalid operand for unary op {s} on type {s} at line={d},col={d}",
                         .{ e.operator.lexeme, @tagName(right), e.operator.line_num, e.operator.col },
@@ -205,13 +163,13 @@ pub const Interpreter = struct {
         }
     }
 
-    fn evaluate_binary(self: *Self, e: BinaryExpr) RuntimeError!Value {
-        const left = try self.evaluate_expr(e.left.*);
-        const right = try self.evaluate_expr(e.right.*);
+    fn interpret_binary(self: *Self, e: expr.BinaryExpr) RuntimeError!Value {
+        const left = try self.interpret_expr(e.left.*);
+        const right = try self.interpret_expr(e.right.*);
 
         if (!check_op_types(.Number, left, right))
             try self.raise_err(
-                error.BinaryOperandMismatch,
+                error.BinaryOperandTypeMismatch,
                 e.operator,
                 "invalid operands for binary op {s} on types {s} and {s} at line={d},col={d}",
                 .{
@@ -246,11 +204,11 @@ pub const Interpreter = struct {
         };
     }
 
-    fn evaluate_group(self: *Self, e: GroupExpr) RuntimeError!Value {
-        return try self.evaluate_expr(e.expression.*);
+    fn interpret_group(self: *Self, e: expr.GroupExpr) RuntimeError!Value {
+        return try self.interpret_expr(e.expression.*);
     }
 
-    fn eval_var_expr(self: *Self, e: VariableExpr) RuntimeError!Value {
+    fn interpret_var_expr(self: *Self, e: expr.VariableExpr) RuntimeError!Value {
         const val = self.environment.get(e.name.lexeme) catch |err| {
             switch (err) {
                 error.NotDeclaredAndUndefined => try self.raise_err(
@@ -271,9 +229,9 @@ pub const Interpreter = struct {
         return val;
     }
 
-    fn eval_asgn_expr(self: *Self, e: AssignExpr) RuntimeError!Value {
+    fn interpret_asgn_expr(self: *Self, e: expr.AssignExpr) RuntimeError!Value {
         // TODO: write tests
-        const value = try self.evaluate_expr(e.value.*);
+        const value = try self.interpret_expr(e.value.*);
         self.environment.assign(e.name, value) catch
             try self.raise_err(
             error.UndefinedVar,
@@ -284,111 +242,67 @@ pub const Interpreter = struct {
         return value;
     }
 
-    pub fn evaluate_expr(self: *Self, e: Expr) RuntimeError!Value {
+    pub fn interpret_expr(self: *Self, e: expr.Expr) RuntimeError!Value {
         return switch (e) {
-            .Binary => |bin| try self.evaluate_binary(bin),
-            .Unary => |un| try self.evaluate_unary(un),
-            .Group => |grp| try self.evaluate_group(grp),
-            .Literal => |lit| evaluate_literal(lit),
-            .Variable => |v| try self.eval_var_expr(v),
-            .Assign => |a| try self.eval_asgn_expr(a),
-            .Call => |c| try self.eval_call_expr(c),
+            .Binary => |bin| try self.interpret_binary(bin),
+            .Unary => |un| try self.interpret_unary(un),
+            .Group => |grp| try self.interpret_group(grp),
+            .Literal => |lit| interpret_literal(lit),
+            .Variable => |v| try self.interpret_var_expr(v),
+            .Assign => |a| try self.interpret_asgn_expr(a),
+            .Call => |c| try self.interpret_call_expr(c),
             else => unreachable,
         };
     }
 
     // print "hi" or 2; // "hi".
     // print nil or "yes"; // "yes".
-    fn eval_logical_expr(self: *Self, e: LogicalExpr) RuntimeError!Value {
+    fn interpret_logical_expr(self: *Self, e: expr.LogicalExpr) RuntimeError!Value {
         // TODO: Test logical expression
-        const left = try self.evaluate_expr(e.left.*);
+        const left = try self.interpret_expr(e.left.*);
 
         switch (e.operator.token_type) {
             .OR => if (left.is_truthy()) return left,
             else => if (!left.is_truthy()) return left,
         }
 
-        return try self.evaluate_expr(e.right.*);
+        return try self.interpret_expr(e.right.*);
     }
 
-    pub fn eval_block(self: *Self, stmts: std.ArrayList(Stmt), envr: Environment) RuntimeError!void {
+    pub fn interpret_block(self: *Self, block: std.ArrayList(expr.Stmt), envr: env.Environment) RuntimeError!void {
         const prev = self.environment;
+        defer self.environment = prev;
 
         self.environment = envr;
-        for (stmts.items) |stmt| {
-            try self.evaluate_stmt(stmt);
-        }
-
-        self.environment = prev;
-    }
-
-    // Evaluating Statements
-    fn eval_print_stmt(self: *Self, e: PrintStmt) RuntimeError!void {
-        const val = try self.evaluate_expr(e);
-        switch (val) {
-            .String => |str| std.debug.print("{s}", .{str}),
-            .Number => |num| std.debug.print("{d}", .{num}),
-            .Bool => |b| std.debug.print("{?}", .{b}),
-            .Nil => std.debug.print("nil", .{}),
-            .Func => std.debug.print("func", .{}),
-        }
-    }
-    fn eval_expr_stmt(self: *Self, e: ExprStmt) RuntimeError!Value {
-        return try self.evaluate_expr(e);
-    }
-    fn eval_var_stmt(self: *Self, e: VarStmt) RuntimeError!void {
-        var val: ?Value = null;
-        if (e.initializer) |in| {
-            val = try self.evaluate_expr(in);
-        }
-        try self.environment.define(e.name.lexeme, val);
-    }
-
-    fn eval_block_stmt(self: *Self, stmt: BlockStmt) RuntimeError!void {
-        const enclosing = try self.allocator.create(Environment);
-        enclosing.* = self.environment;
-        try self.eval_block(stmt, Environment.with_enclosing(self.allocator, enclosing));
-    }
-
-    fn eval_if_stmt(self: *Self, stmt: IfStmt) RuntimeError!void {
-        var condition = try self.evaluate_expr(stmt.condition);
-        if (condition.is_truthy()) {
-            try self.evaluate_stmt(stmt.then_br.*);
-            return;
-        }
-        if (stmt.else_br) |e| {
-            try self.evaluate_stmt(e.*);
-            return;
+        for (block.items) |stmt| {
+            // if (self.return_val) |val| return val;
+            try self.execute_stmt(stmt);
         }
     }
 
-    fn eval_while_stmt(self: *Self, stmt: WhileStmt) RuntimeError!void {
-        while ((try self.evaluate_expr(stmt.condition)).is_truthy()) {
-            try self.evaluate_stmt(stmt.body.*);
-        }
-    }
-
-    fn eval_call_expr(self: *Self, stmt: expr.CallExpr) RuntimeError!Value {
+    fn interpret_call_expr(self: *Self, e: expr.CallExpr) RuntimeError!Value {
         // const callee = self.environment.get("clock") catch @panic("err");
-        const callee = try self.evaluate_expr(stmt.callee.*);
+        std.debug.print("Here!!\n", .{});
+        // std.debug.print("{any}", .{self.environment.get("fib")});
+        const callee = try self.interpret_expr(e.callee.*);
 
         var args = std.ArrayList(Value).init(self.allocator);
-        for (stmt.args.items) |arg| {
-            try args.append(try self.evaluate_expr(arg));
+        for (e.args.items) |arg| {
+            try args.append(try self.interpret_expr(arg));
         }
 
         var func = switch (callee) {
             .Func => |c| c,
             else => {
-                try self.raise_err(error.InvalidCallAttempt, stmt.paren, "Can only call functions and classes.", .{});
+                try self.raise_err(error.InvalidCallAttempt, e.paren, "Can only call functions and classes.", .{});
                 return error.InvalidCallAttempt;
             },
         };
 
         // checking if number of expected parameters = number of passed arguements in a function call
-        if (args.items.len != func.arity()) {
-            try self.raise_err(error.InvalidCallAttempt, stmt.paren, "Expected {d} arguments but got {d}", .{
-                func.arity(),
+        if (args.items.len != func.arity(self)) {
+            try self.raise_err(error.InvalidCallAttempt, e.paren, "Expected {d} arguments but got {d}", .{
+                func.arity(self),
                 args.items.len,
             });
             return error.MismatchedArity;
@@ -398,20 +312,79 @@ pub const Interpreter = struct {
         return try func.call(self, args.items);
     }
 
-    fn eval_func_stmt(self: *Self, stmt: FuncStmt) RuntimeError!void {
-        var func = try callable.Function.init(stmt, self.allocator);
-        try self.environment.define(stmt.name.lexeme, Value{ .Func = func.callable() });
+    pub fn execute_stmt(self: *Self, stmt: expr.Stmt) RuntimeError!void {
+        switch (stmt) {
+            .BlockStmt => |e| {
+                const enclosing = try self.allocator.create(env.Environment);
+                enclosing.* = self.environment;
+                try self.interpret_block(e, env.Environment.with_enclosing(self.allocator, enclosing));
+            },
+            .ExprStmt => |e| {
+                _ = try self.interpret_expr(e);
+            },
+            .FuncStmt => |f| {
+                const closure = try self.allocator.create(env.Environment);
+                closure.* = self.environment;
+                const func = callable.DefinedFunction{
+                    .id = self.get_new_id(),
+                    .name = f.name.lexeme,
+                    .params = try f.params.clone(),
+                    .closure = closure,
+                    .body = try f.body.clone(),
+                };
+
+                try self.environment.define(f.name.lexeme, Value{ .Func = callable.Callable{ .DefinedFunction = func } });
+                try func.closure.define(f.name.lexeme, Value{ .Func = callable.Callable{ .DefinedFunction = func } });
+            },
+            .IfStmt => |i| {
+                var condition = try self.interpret_expr(i.condition);
+                if (condition.is_truthy()) {
+                    try self.execute_stmt(i.then_br.*);
+                    return;
+                }
+                if (i.else_br) |e| {
+                    try self.execute_stmt(e.*);
+                    return;
+                }
+            },
+            .PrintStmt => |e| {
+                const val = try self.interpret_expr(e);
+                switch (val) {
+                    .String => |str| std.debug.print("{s}", .{str}),
+                    .Number => |num| std.debug.print("{d}", .{num}),
+                    .Bool => |b| std.debug.print("{?}", .{b}),
+                    .Nil => std.debug.print("nil", .{}),
+                    .Func => std.debug.print("func", .{}),
+                }
+            },
+            .ReturnStmt => |r| {
+                if (r.expression) |e| {
+                    self.return_val = try self.interpret_expr(e);
+                    return;
+                }
+                self.return_val = Value{ .Nil = undefined };
+            },
+            .VarStmt => |e| {
+                var val: ?Value = null;
+                if (e.initializer) |in| {
+                    val = try self.interpret_expr(in);
+                }
+                try self.environment.define(e.name.lexeme, val);
+            },
+            .WhileStmt => |w| {
+                while ((try self.interpret_expr(w.condition)).is_truthy()) {
+                    try self.execute_stmt(w.body.*);
+                }
+            },
+        }
     }
 
-    fn evaluate_stmt(self: *Self, stmt: Stmt) RuntimeError!void {
-        switch (stmt) {
-            .PrintStmt => |s| try self.eval_print_stmt(s),
-            .ExprStmt => |e| _ = try self.eval_expr_stmt(e),
-            .VarStmt => |v| try self.eval_var_stmt(v),
-            .BlockStmt => |b| try self.eval_block_stmt(b),
-            .IfStmt => |i| try self.eval_if_stmt(i),
-            .WhileStmt => |w| try self.eval_while_stmt(w),
-            .FuncStmt => |f| try self.eval_func_stmt(f),
+    pub fn interpret(self: *Self, stmts: []expr.Stmt) RuntimeError!void {
+        for (stmts) |value| {
+            self.execute_stmt(value) catch |err| switch (err) {
+                error.OutOfMemory => @panic("Error out of memory"),
+                else => return err,
+            };
         }
     }
 };
@@ -422,13 +395,25 @@ test "Defined Func Stmt" {
     const allocator = arena.allocator();
 
     const src =
-        \\ var x = 10;
-        \\ var y = 20;
-        \\ fun apple(x,y) {
-        \\   print x+y;
+        // \\ var y = 20;
+        // \\ fun ball(b) {
+        // \\ return b+10;
+        // \\ }
+        // \\
+        // \\ fun apple(a) {
+        // \\ return ball(a)+10;
+        // \\ }
+        // \\
+        // \\ print apple(y);
+        \\ fun apple(n) {
+        \\
+        \\ fun ball(x) { return x+1;}
+        \\
+        \\ return ball(n);
         \\ }
         \\
-        \\ apple(x,y);
+        \\ print fib(10);
+        \\
     ;
 
     var lexer = try scanner.Scanner.init(allocator, src);
@@ -446,13 +431,14 @@ test "Defined Func Stmt" {
 
     var interpreter = Interpreter.init(allocator);
     std.debug.print("\n", .{});
-    for (stmts.items) |stmt| {
-        interpreter.evaluate_stmt(stmt) catch {
-            if (interpreter.has_error) {
-                std.debug.print("{s}", .{interpreter.runtime_error.message});
-            }
-        };
-    }
+    interpreter.interpret(stmts.items) catch |err| {
+        if (interpreter.runtime_error) |e| {
+            std.debug.print("{s}", .{e.message});
+            // std.debug.print("{any}", .{interpreter.callstack.items});
+        } else {
+            std.debug.print("{any}", .{err});
+        }
+    };
     std.debug.print("\n", .{});
 }
 
@@ -481,7 +467,7 @@ test "Native Func Stmt" {
     var interpreter = Interpreter.init(allocator);
     std.debug.print("\n", .{});
     for (stmts.items) |stmt| {
-        try interpreter.evaluate_stmt(stmt);
+        try interpreter.execute_stmt(stmt);
     }
     std.debug.print("\n", .{});
 }
@@ -511,7 +497,7 @@ test "While Statement" {
     var interpreter = Interpreter.init(allocator);
     std.debug.print("\n", .{});
     for (stmts.items) |stmt| {
-        try interpreter.evaluate_stmt(stmt);
+        try interpreter.execute_stmt(stmt);
     }
     std.debug.print("\n", .{});
 }
@@ -538,7 +524,7 @@ test "If Statement" {
 
     var interpreter = Interpreter.init(allocator);
     for (stmts.items) |stmt| {
-        try interpreter.evaluate_stmt(stmt);
+        try interpreter.execute_stmt(stmt);
     }
 }
 
@@ -551,8 +537,6 @@ test "Block Statement" {
         \\ var outer = 10;
         \\ { 
         \\    var value = (20 * 20); 
-        \\    outer;
-        \\    value;
         \\ }
         \\ outer;
     ;
@@ -563,12 +547,11 @@ test "Block Statement" {
     var par = parser.Parser.init(allocator, try lexer.tokens.clone());
 
     const stmts = try par.parse_stmts(allocator);
-    // std.debug.print("{s}", .{(try stmts.items[0].to_string(allocator)).items});
 
     var interpreter = Interpreter.init(allocator);
 
     for (stmts.items) |stmt| {
-        try interpreter.evaluate_stmt(stmt);
+        try interpreter.execute_stmt(stmt);
     }
 }
 
@@ -580,23 +563,15 @@ test "Declaration & Assignment Expression" {
     const src =
         \\ var value = (20 * 20);
     ;
-
     var lexer = try scanner.Scanner.init(allocator, src);
     try lexer.scan_tokens();
-
     var par = parser.Parser.init(allocator, try lexer.tokens.clone());
-
     const stmts = try par.parse_stmts(allocator);
-
     var interpreter = Interpreter.init(allocator);
+    try interpreter.execute_stmt(stmts.items[0]);
 
-    try interpreter.evaluate_stmt(stmts.items[0]);
     var val = try interpreter.environment.get("value");
-    try std.testing.expect(val.equal(val_num(400)));
-
-    // try interpreter.evaluate_stmt(stmts.items[1]);
-    // val = try interpreter.environment.get("value");
-    // try std.testing.expect(val.equal(val_num(400)));
+    try std.testing.expect(val.equal(Value{ .Number = 400 }));
 }
 
 test "Expression Statement Evaluations" {
@@ -605,58 +580,42 @@ test "Expression Statement Evaluations" {
     const alloc = arena.allocator();
 
     const table = [_]struct { []const u8, Value }{
-        .{ "true;", val_bool(true) },
-        .{ "false;", val_bool(false) },
-        .{ "!false;", val_bool(true) },
-        .{ "!true;", val_bool(false) },
-        .{ "1;", val_num(1) },
-        .{ "-1;", val_num(-1) },
+        .{ "true;", Value{ .Bool = true } },
+        .{ "false;", Value{ .Bool = false } },
+        .{ "!false;", Value{ .Bool = true } },
+        .{ "!true;", Value{ .Bool = false } },
+        .{ "1;", Value{ .Number = 1 } },
+        .{ "-1;", Value{ .Number = -1 } },
 
-        .{ "10 > 11;", val_bool(false) },
-        .{ "10 < 11;", val_bool(true) },
-        .{ "10 >= 10;", val_bool(true) },
-        .{ "10 <= 10;", val_bool(true) },
-        .{ "10 <= 11;", val_bool(true) },
-        .{ "10 <= 9;", val_bool(false) },
+        .{ "10 > 11;", Value{ .Bool = false } },
+        .{ "10 < 11;", Value{ .Bool = true } },
+        .{ "10 >= 10;", Value{ .Bool = true } },
+        .{ "10 <= 10;", Value{ .Bool = true } },
+        .{ "10 <= 11;", Value{ .Bool = true } },
+        .{ "10 <= 9;", Value{ .Bool = false } },
 
-        .{ "10 == 9;", val_bool(false) },
-        .{ "10 == 10;", val_bool(true) },
-        .{ "10 != 10;", val_bool(false) },
-        .{ "10 != 9;", val_bool(true) },
+        .{ "10 == 9;", Value{ .Bool = false } },
+        .{ "10 == 10;", Value{ .Bool = true } },
+        .{ "10 != 10;", Value{ .Bool = false } },
+        .{ "10 != 9;", Value{ .Bool = true } },
 
-        .{ "1+1;", val_num(2) },
-        .{ "2*3;", val_num(6) },
-        .{ "6/3;", val_num(2) },
-        .{ "6-3;", val_num(3) },
+        .{ "1+1;", Value{ .Number = 2 } },
+        .{ "2*3;", Value{ .Number = 6 } },
+        .{ "6/3;", Value{ .Number = 2 } },
+        .{ "6-3;", Value{ .Number = 3 } },
 
-        .{ "\"hello world\";", val_str("hello world") },
+        .{ "\"hello world\";", Value{ .String = "hello world" } },
     };
     for (table) |val| {
-        const evaluated = try eval_str(alloc, val[0]);
-        // std.debug.print("\n{} {}\n", .{ evaluated, val[1] });
-        try std.testing.expect(evaluated.equal(val[1]));
+        var lex = try scanner.Scanner.init(alloc, val[0]);
+        try lex.scan_tokens();
+        var p = parser.Parser.init(alloc, try lex.tokens.clone());
+        var stmts = try p.parse_stmts(alloc);
+
+        var interpreter = Interpreter.init(alloc);
+        const result = try alloc.create(Value);
+        result.* = try interpreter.interpret_expr(stmts.pop().ExprStmt);
+        // std.debug.print("\n{} {}\n", .{ interpretd, val[1] });
+        try std.testing.expect(result.equal(val[1]));
     }
-}
-
-fn val_bool(val: bool) Value {
-    return Value{ .Bool = val };
-}
-fn val_str(val: []const u8) Value {
-    return Value{ .String = val };
-}
-fn val_num(val: f32) Value {
-    return Value{ .Number = val };
-}
-
-/// Only works for expression statements.
-fn eval_str(alloc: std.mem.Allocator, str: []const u8) !Value {
-    var lex = try Scanner.init(alloc, str);
-    try lex.scan_tokens();
-    var p = Parser.init(alloc, try lex.tokens.clone());
-    var stmts = try p.parse_stmts(alloc);
-
-    var interpreter = Interpreter.init(alloc);
-    const val = try alloc.create(Value);
-    val.* = try interpreter.eval_expr_stmt(stmts.pop().ExprStmt);
-    return val.*;
 }
