@@ -13,8 +13,12 @@ pub const RuntimeError = error{
     UnaryOperandTypeMismatch,
     IllegalOperator,
     UndefinedVar,
+    ReturnNotInsideFunction,
+    VarAlreadyDefinedInLocalScope,
     InvalidCallAttempt,
     MismatchedArity,
+    OnlyInstancesHaveProperties,
+    UndefinedProperty,
 } || std.mem.Allocator.Error;
 
 pub const ValueType = enum {
@@ -22,6 +26,8 @@ pub const ValueType = enum {
     String,
     Bool,
     Func,
+    Class,
+    ClassInstance,
     Nil,
 };
 
@@ -31,6 +37,8 @@ pub const Value = union(ValueType) {
     String: []const u8,
     Bool: bool,
     Func: callable.Callable,
+    Class: callable.Callable,
+    ClassInstance: callable.Callable,
     Nil,
 
     pub fn equal(self: Value, other: Value) bool {
@@ -39,7 +47,7 @@ pub const Value = union(ValueType) {
             .String => @as(ValueType, other) == .String,
             .Bool => @as(ValueType, other) == .Bool,
             .Nil => @as(ValueType, other) == .Nil,
-            .Func => false,
+            else => false,
         };
         if (!same_type) return false;
 
@@ -48,7 +56,7 @@ pub const Value = union(ValueType) {
             .String => std.mem.eql(u8, self.String, other.String),
             .Bool => self.Bool == other.Bool,
             .Nil => true,
-            .Func => false,
+            else => false,
         };
     }
 
@@ -87,9 +95,12 @@ pub const Interpreter = struct {
     callstack: std.ArrayList(CallStackEntry),
     return_val: ?Value = null,
 
-    fn init(allocator: Allocator) Self {
-        var globals = env.Environment.init(allocator);
+    classes: std.AutoArrayHashMap(u64, callable.Class),
+    class_instances: std.AutoArrayHashMap(u64, callable.ClassInstance),
+    functions: std.AutoArrayHashMap(u64, callable.DefinedFunction),
 
+    pub fn init(allocator: Allocator) Self {
+        var globals = env.Environment.init(allocator);
         const clock = callable.def_clock();
         globals.define("clock", Value{ .Func = clock }) catch {
             @panic("Error defining native functions.");
@@ -102,14 +113,18 @@ pub const Interpreter = struct {
             .environment = globals,
             .callstack = std.ArrayList(CallStackEntry).init(allocator),
             .runtime_error = null,
+
+            .classes = std.AutoArrayHashMap(u64, callable.Class).init(allocator),
+            .class_instances = std.AutoArrayHashMap(u64, callable.ClassInstance).init(allocator),
+            .functions = std.AutoArrayHashMap(u64, callable.DefinedFunction).init(allocator),
         };
     }
 
-    fn get_new_id(self: *Self) u64 {
+    fn generate_id(self: *Self) u64 {
         self.id_counter = self.id_counter + 1;
         return self.id_counter;
     }
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         try self.environment.deinit();
     }
 
@@ -214,15 +229,16 @@ pub const Interpreter = struct {
                 error.NotDeclaredAndUndefined => try self.raise_err(
                     error.UndefinedVar,
                     e.name,
-                    "use of undefined var '{s}' at line={d},col={d}. {s} was never declared.",
+                    "use of undefined var '{s}' at line={d},col={d}. '{s}' was never declared.",
                     .{ e.name.lexeme, e.name.line_num, e.name.col, e.name.lexeme },
                 ),
                 error.DeclaredButUndefined => try self.raise_err(
                     error.UndefinedVar,
                     e.name,
-                    "use of undefined var '{s}' at line={d},col={d}. But {s} was previously declared.",
+                    "use of undefined var '{s}' at line={d},col={d}. But '{s}' was previously declared.",
                     .{ e.name.lexeme, e.name.line_num, e.name.col, e.name.lexeme },
                 ),
+                else => {},
             }
             return error.UndefinedVar;
         };
@@ -230,7 +246,6 @@ pub const Interpreter = struct {
     }
 
     fn interpret_asgn_expr(self: *Self, e: expr.AssignExpr) RuntimeError!Value {
-        // TODO: write tests
         const value = try self.interpret_expr(e.value.*);
         self.environment.assign(e.name, value) catch
             try self.raise_err(
@@ -242,6 +257,46 @@ pub const Interpreter = struct {
         return value;
     }
 
+    fn interpret_get_expr(self: *Self, e: expr.GetExpr) RuntimeError!Value {
+        const obj = try self.interpret_expr(e.object.*);
+        switch (obj) {
+            .ClassInstance => |i| switch (i) {
+                .ClassInstance => |ci| {
+                    return ci.get(e.name.lexeme) catch {
+                        try self.raise_err(error.UndefinedProperty, e.name, "Undefined property line={d},col={d}", .{
+                            e.name.line_num,
+                            e.name.col,
+                        });
+                        return error.UndefinedProperty;
+                    };
+                },
+                else => {},
+            },
+            else => {},
+        }
+        try self.raise_err(error.OnlyInstancesHaveProperties, scanner.Token.init(.FUN, "fun", null, 100, 100), "Only instances have properties line={d},col={d}", .{ 100, 100 });
+        return error.OnlyInstancesHaveProperties;
+    }
+
+    fn interpret_set_expr(self: *Self, e: expr.SetExpr) RuntimeError!Value {
+        var obj = try self.interpret_expr(e.object.*);
+        switch (obj) {
+            .ClassInstance => |i| switch (i) {
+                .ClassInstance => {
+                    const value = try self.interpret_expr(e.val.*);
+                    try obj.ClassInstance.ClassInstance.set(e.name.lexeme, value);
+                    // e.object = obj;
+                    self.environment.assign(scanner.Token.init(.IDENTIFIER, "test", null, 10, 10), obj) catch unreachable;
+                    return value;
+                },
+                else => {},
+            },
+            else => {},
+        }
+        try self.raise_err(error.OnlyInstancesHaveProperties, scanner.Token.init(.FUN, "fun", null, 100, 100), "Only instances have fields line={d},col={d}", .{ 100, 100 });
+        return error.OnlyInstancesHaveProperties;
+    }
+
     pub fn interpret_expr(self: *Self, e: expr.Expr) RuntimeError!Value {
         return switch (e) {
             .Binary => |bin| try self.interpret_binary(bin),
@@ -251,6 +306,8 @@ pub const Interpreter = struct {
             .Variable => |v| try self.interpret_var_expr(v),
             .Assign => |a| try self.interpret_asgn_expr(a),
             .Call => |c| try self.interpret_call_expr(c),
+            .GetExpr => |g| try self.interpret_get_expr(g),
+            .SetExpr => |s| try self.interpret_set_expr(s),
             else => unreachable,
         };
     }
@@ -291,8 +348,10 @@ pub const Interpreter = struct {
             try args.append(try self.interpret_expr(arg));
         }
 
+        // this could either be a function or a class constructor.
         var func = switch (callee) {
-            .Func => |c| c,
+            .Func => |f| f,
+            .Class => |c| c,
             else => {
                 try self.raise_err(error.InvalidCallAttempt, e.paren, "Can only call functions and classes.", .{});
                 return error.InvalidCallAttempt;
@@ -308,7 +367,18 @@ pub const Interpreter = struct {
             return error.MismatchedArity;
         }
 
-        // TODO: Implement Callable
+        // const call_result = try self.allocator.create(Value);
+        // call_result.* = try func.call(self, args.items);
+        // // switch (callee) {
+        // //     .Class => {
+        // //         var result =
+        // //         try result.ClassInstance.ClassInstance.set("native_prop_1", Value{ .String = "test" });
+        // //         return result;
+        // //     },
+        // //     else => {
+        //         return try func.call(self, args.items);
+        //     },
+        // }
         return try func.call(self, args.items);
     }
 
@@ -319,6 +389,14 @@ pub const Interpreter = struct {
                 enclosing.* = self.environment;
                 try self.interpret_block(e, env.Environment.with_enclosing(self.allocator, enclosing));
             },
+            .ClassStmt => |c| {
+                try self.environment.define(c.name.lexeme, null);
+                const class = callable.Class{
+                    .name = c.name.lexeme,
+                    .id = self.generate_id(),
+                };
+                try self.environment.define(c.name.lexeme, Value{ .Class = callable.Callable{ .Class = class } });
+            },
             .ExprStmt => |e| {
                 _ = try self.interpret_expr(e);
             },
@@ -326,7 +404,7 @@ pub const Interpreter = struct {
                 const closure = try self.allocator.create(env.Environment);
                 closure.* = self.environment;
                 const func = callable.DefinedFunction{
-                    .id = self.get_new_id(),
+                    .id = self.generate_id(),
                     .name = f.name.lexeme,
                     .params = try f.params.clone(),
                     .closure = closure,
@@ -354,21 +432,29 @@ pub const Interpreter = struct {
                     .Number => |num| std.debug.print("{d}", .{num}),
                     .Bool => |b| std.debug.print("{?}", .{b}),
                     .Nil => std.debug.print("nil", .{}),
-                    .Func => std.debug.print("func", .{}),
+                    .Func => |f| std.debug.print("func {s}", .{f.name()}),
+                    .Class => |c| std.debug.print("class {s}", .{c.name()}),
+                    .ClassInstance => |i| std.debug.print("instance {s}", .{i.name()}),
                 }
             },
             .ReturnStmt => |r| {
-                if (r.expression) |e| {
-                    self.return_val = try self.interpret_expr(e);
-                    return;
+                if (self.callstack.getLastOrNull()) |_| {
+                    if (r.expression) |e| {
+                        self.return_val = try self.interpret_expr(e);
+                        return;
+                    }
+                    self.return_val = Value{ .Nil = undefined };
                 }
-                self.return_val = Value{ .Nil = undefined };
+
+                try self.raise_err(error.ReturnNotInsideFunction, r.keyword, "return not called from inside a function, line={d},col={d}", .{ r.keyword.line_num, r.keyword.col });
             },
             .VarStmt => |e| {
                 var val: ?Value = null;
                 if (e.initializer) |in| {
                     val = try self.interpret_expr(in);
+                    // std.debug.print("\nHas Initializer: {any}\n", .{val});
                 }
+
                 try self.environment.define(e.name.lexeme, val);
             },
             .WhileStmt => |w| {
@@ -405,15 +491,9 @@ test "Defined Func Stmt" {
         // \\ }
         // \\
         // \\ print apple(y);
-        \\ fun apple(n) {
-        \\
-        \\ fun ball(x) { return x+1;}
-        \\
-        \\ return ball(n);
-        \\ }
-        \\
-        \\ print fib(10);
-        \\
+        \\ class Test {}
+        \\ var test = Test();
+        \\ test.name = 10;
     ;
 
     var lexer = try scanner.Scanner.init(allocator, src);
@@ -439,6 +519,14 @@ test "Defined Func Stmt" {
             std.debug.print("{any}", .{err});
         }
     };
+
+    const inst = try interpreter.environment.get("test");
+
+    std.debug.print("\nInstance: {any}\n", .{inst});
+    for (inst.ClassInstance.ClassInstance.fields.keys()) |field| {
+        std.debug.print("\nKey: {s}\n", .{field});
+    }
+
     std.debug.print("\n", .{});
 }
 

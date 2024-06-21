@@ -6,6 +6,7 @@ const Token = @import("scanner.zig").Token;
 pub const EnvError = error{
     DeclaredButUndefined,
     NotDeclaredAndUndefined,
+    VariableAlreadyDefined,
 };
 
 pub const Environment = struct {
@@ -40,6 +41,13 @@ pub const Environment = struct {
         }
 
         return error.NotDeclaredAndUndefined;
+    }
+
+    pub fn local_exists(self: *Self, name: []const u8) bool {
+        if (self.values.getKey(name)) |_| {
+            return true;
+        }
+        return false;
     }
 
     pub fn define(self: *Self, name: []const u8, val: ?Value) !void {

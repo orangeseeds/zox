@@ -6,23 +6,29 @@ const RuntimeErr = @import("interpreter.zig").RuntimeError;
 const ArrayList = @import("std").ArrayList;
 const Expr = @import("expression.zig").Expr;
 const Environment = @import("environment.zig").Environment;
-const Error = error{} || RuntimeErr;
+const Error = error{UndefinedProperty} || RuntimeErr;
 const FuncStmt = @import("expression.zig").FuncStmt;
 const Token = @import("scanner.zig").Token;
 
 pub const CallableType = enum {
     NativeFunction,
     DefinedFunction,
+    Class,
+    ClassInstance,
 };
 pub const Callable = union(CallableType) {
     const Self = @This();
     NativeFunction: NativeFunction,
     DefinedFunction: DefinedFunction,
+    Class: Class,
+    ClassInstance: ClassInstance,
 
     pub fn arity(self: Self, interpreter: *Interpreter) usize {
         return switch (self) {
             .NativeFunction => |n| n.arity(interpreter),
             .DefinedFunction => |d| d.arity(interpreter),
+            .Class => |c| c.arity(interpreter),
+            .ClassInstance => |i| i.arity(interpreter),
         };
     }
 
@@ -30,6 +36,17 @@ pub const Callable = union(CallableType) {
         return switch (self) {
             .NativeFunction => |n| n.call(interpreter, args),
             .DefinedFunction => |d| d.call(interpreter, args),
+            .Class => |c| c.call(interpreter, args),
+            .ClassInstance => |i| i.call(interpreter, args),
+        };
+    }
+
+    pub fn name(self: Self) []const u8 {
+        return switch (self) {
+            .NativeFunction => |n| n.name,
+            .DefinedFunction => |f| f.name,
+            .Class => |c| c.name,
+            .ClassInstance => |i| i.class.name,
         };
     }
 };
@@ -93,6 +110,56 @@ pub const DefinedFunction = struct {
     }
 };
 
+pub const ClassInstance = struct {
+    const Self = @This();
+    id: u64,
+    class: Class,
+    fields: std.StringArrayHashMap(Value),
+
+    pub fn init(id: u64, class: Class, allocator: std.mem.Allocator) Self {
+        return Self{
+            .id = id,
+            .class = class,
+            .fields = std.StringArrayHashMap(Value).init(allocator),
+        };
+    }
+
+    pub fn arity(_: Self, _: *Interpreter) usize {
+        return 0;
+    }
+
+    pub fn call(_: Self, _: *Interpreter, _: []Value) Error!Value {
+        return Value{ .Nil = undefined };
+    }
+
+    pub fn get(self: Self, name: []const u8) Error!Value {
+        if (self.fields.get(name)) |val| {
+            return val;
+        }
+        return error.UndefinedProperty;
+    }
+
+    pub fn set(self: *Self, name: []const u8, value: Value) Error!void {
+        try self.fields.put(name, value);
+    }
+};
+
+pub const Class = struct {
+    const Self = @This();
+    id: u64,
+    name: []const u8,
+
+    fn arity(_: Self, _: *Interpreter) usize {
+        return 0;
+    }
+
+    pub fn call(self: Self, interpreter: *Interpreter, _: []Value) Error!Value {
+        const instance = ClassInstance.init(982, self, interpreter.allocator);
+        // try instance.set("native_prop", Value{ .String = "test" });
+        return Value{ .ClassInstance = .{ .ClassInstance = instance } };
+    }
+};
+
 pub fn def_clock() Callable {
     const clock_native = struct {
         fn call(_: NativeFunction, _: *Interpreter, _: []Value) Error!Value {
@@ -107,4 +174,21 @@ pub fn def_clock() Callable {
         .callable = clock_native.call,
     };
     return Callable{ .NativeFunction = native };
+}
+
+test "Class and Attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var int = Interpreter.init(allocator);
+    const args = [_]Value{};
+
+    var class = Class{ .id = 0, .name = "Test" };
+    const callable = try class.call(&int, &args);
+
+    var instance = callable.ClassInstance.ClassInstance;
+    try instance.set("test_prop", Value{ .String = "Value" });
+    const val = try instance.get("test_prop");
+
+    try std.testing.expectEqualStrings("Value", val.String);
 }

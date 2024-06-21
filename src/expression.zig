@@ -9,6 +9,7 @@ pub const UnaryExpr = struct { operator: Token, right: *Expr };
 pub const GroupExpr = struct { expression: *Expr };
 pub const LiteralExpr = struct { value: ?Literal };
 pub const VariableExpr = struct { name: Token };
+pub const GetExpr = struct { object: *Expr, name: Token };
 
 // TODO: make FuncExpr work like var expr
 pub const FuncExpr = struct { name: Token };
@@ -16,6 +17,7 @@ pub const AssignExpr = struct { name: Token, value: *Expr };
 pub const LogicalExpr = struct { left: *Expr, operator: Token, right: *Expr };
 pub const CallExpr = struct { callee: *Expr, paren: Token, args: std.ArrayList(Expr) };
 pub const BlockExpr = std.ArrayList(Expr);
+pub const SetExpr = struct { object: *Expr, name: Token, val: *Expr };
 
 pub const Expr = union(enum) {
     const Self = @This();
@@ -28,6 +30,8 @@ pub const Expr = union(enum) {
     Logical: LogicalExpr,
     Call: CallExpr,
     Block: BlockExpr,
+    GetExpr: GetExpr,
+    SetExpr: SetExpr,
 
     fn parenthesize_recur(self: Self, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), expr: Expr) !void {
         // std.debug.print("Test: {any}\n", .{expr});
@@ -95,6 +99,17 @@ pub const Expr = union(enum) {
                 try buff.append(')');
                 try buff.append(')');
             },
+            .GetExpr => |g| {
+                // std.debug.print("{any}", .{g.object.Call.callee.GetExpr.object});
+                try self.parenthesize_recur(allocator, buff, g.object.*);
+                try buff.writer().print(".(getter {s})", .{g.name.lexeme});
+            },
+            .SetExpr => |s| {
+                try self.parenthesize_recur(allocator, buff, s.object.*);
+                try buff.writer().print(".(setter {s})", .{s.name.lexeme});
+                try buff.writer().print("=", .{});
+                try self.parenthesize_recur(allocator, buff, s.val.*);
+            },
         }
     }
 
@@ -115,6 +130,7 @@ pub const IfStmt = struct { condition: Expr, then_br: *Stmt, else_br: ?*Stmt };
 pub const WhileStmt = struct { condition: Expr, body: *Stmt };
 pub const FuncStmt = struct { name: Token, params: std.ArrayList(Token), body: std.ArrayList(Stmt) };
 pub const ReturnStmt = struct { keyword: Token, expression: ?Expr };
+pub const ClassStmt = struct { name: Token, methods: std.ArrayList(Stmt) };
 pub const Stmt = union(enum) {
     PrintStmt: Expr,
     ExprStmt: Expr,
@@ -124,6 +140,7 @@ pub const Stmt = union(enum) {
     WhileStmt: WhileStmt,
     FuncStmt: FuncStmt,
     ReturnStmt: ReturnStmt,
+    ClassStmt: ClassStmt,
 
     fn parenthesize_recur(self: Stmt, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), stmt: Stmt) Error!void {
         // std.debug.print("Test: {any}\n", .{expr});
@@ -185,6 +202,7 @@ pub const Stmt = union(enum) {
                     _ = try buff.writer().write("return;");
                 }
             },
+            .ClassStmt => unreachable,
         }
     }
     pub fn to_string(self: Stmt, allocator: std.mem.Allocator) Error!std.ArrayList(u8) {

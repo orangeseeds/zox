@@ -167,10 +167,21 @@ pub const Parser = struct {
         const curr: *Expr = expr;
         while (true) {
             // TODO: check alloc after free
-            if (!self.match(.{.LEFT_PAREN})) break;
-            const new = try self.allocator.create(Expr);
-            new.* = try self.finish_call(expr.*);
-            curr.* = new.*;
+            if (self.match(.{.LEFT_PAREN})) {
+                const new = try self.allocator.create(Expr);
+                new.* = try self.finish_call(expr.*);
+                curr.* = new.*;
+            } else if (self.match(.{.DOT})) {
+                const name = try self.consume(.IDENTIFIER, "Expected property name after '.',");
+                const new = try self.allocator.create(Expr);
+
+                const new_obj = try self.allocator.create(Expr);
+                new_obj.* = expr.*;
+                new.* = Expr{ .GetExpr = .{ .name = name, .object = new_obj } };
+                curr.* = new.*;
+            } else {
+                break;
+            }
         }
 
         return expr.*;
@@ -295,6 +306,9 @@ pub const Parser = struct {
                 .Variable => |v| {
                     const name = v.name;
                     return Expr{ .Assign = .{ .name = name, .value = value } };
+                },
+                .GetExpr => |g| {
+                    return Expr{ .SetExpr = .{ .object = g.object, .name = g.name, .val = value } };
                 },
                 else => {
                     self.push_error(equal_op, "Invalid assignment target");
@@ -525,7 +539,23 @@ pub const Parser = struct {
         return Stmt{ .ReturnStmt = .{ .keyword = keyword, .expression = value } };
     }
 
+    fn class_decl(self: *Self) Error!Stmt {
+        const name = try self.consume(.IDENTIFIER, "Expected class name after 'class' keyword.");
+        _ = try self.consume(.LEFT_BRACE, "Expected '{' before class body.");
+
+        var methods = std.ArrayList(expression_z.Stmt).init(self.allocator);
+
+        while (!self.check(.RIGHT_BRACE) and !self.at_end()) {
+            try methods.append(try self.fun_stmt("method"));
+        }
+
+        _ = try self.consume(.RIGHT_BRACE, "Expected '{' after class body.");
+
+        return Stmt{ .ClassStmt = .{ .name = name, .methods = methods } };
+    }
+
     fn parse_stmt(self: *Self) Error!Stmt {
+        if (self.match(.{.CLASS})) return self.class_decl();
         if (self.match(.{.FUN})) return self.fun_stmt("function");
         if (self.match(.{.FOR})) return self.for_stmt();
         if (self.match(.{.IF})) return try self.if_stmt();
@@ -586,6 +616,8 @@ test "Test Parser" {
         .{ "return;", "return;" },
         .{ "return 10;", "return 10;" },
         .{ "return apple;", "return (var apple );" },
+
+        // .{ "a.b = 10;", "" },
     };
 
     for (cases) |case| {
