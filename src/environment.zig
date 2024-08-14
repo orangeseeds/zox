@@ -43,6 +43,19 @@ pub const Environment = struct {
         return error.NotDeclaredAndUndefined;
     }
 
+    pub fn get_ptr(self: *Self, name: []const u8) EnvError!*Value {
+        if (self.values.getKey(name)) |key| {
+            if (self.values.getPtr(key)) |val| return val orelse
+                error.DeclaredButUndefined;
+        }
+
+        if (self.enclosing) |enclosing| {
+            return try enclosing.get(name);
+        }
+
+        return error.NotDeclaredAndUndefined;
+    }
+
     pub fn local_exists(self: *Self, name: []const u8) bool {
         if (self.values.getKey(name)) |_| {
             return true;

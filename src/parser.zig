@@ -124,6 +124,8 @@ pub const Parser = struct {
 
         if (self.match(.{ .NUMBER, .STRING })) return Expr{ .Literal = .{ .value = self.previous().literal.? } };
 
+        if (self.match(.{.THIS})) return Expr{ .ThisExpr = .{ .keyword = self.previous() } };
+
         if (self.match(.{.IDENTIFIER})) return Expr{ .Variable = .{ .name = self.previous() } };
 
         // check if the start is a LEFT_PAREN, read the immediate expr
@@ -616,6 +618,8 @@ test "Test Parser" {
         .{ "return;", "return;" },
         .{ "return 10;", "return 10;" },
         .{ "return apple;", "return (var apple );" },
+
+        .{ "this;", " this ;" },
 
         // .{ "a.b = 10;", "" },
     };

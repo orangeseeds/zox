@@ -57,12 +57,12 @@ pub const NativeFunction = struct {
     arity_val: usize,
     callable: *const fn (self: NativeFunction, interpreter: *Interpreter, values: []Value) Error!Value,
 
-    fn arity(self: Self, interpreter: *Interpreter) usize {
+    pub fn arity(self: Self, interpreter: *Interpreter) usize {
         _ = interpreter; // autofix
         return self.arity_val;
     }
 
-    fn call(self: Self, interpreter: *Interpreter, value: []Value) Error!Value {
+    pub fn call(self: Self, interpreter: *Interpreter, value: []Value) Error!Value {
         return self.callable(self, interpreter, value);
     }
 };
@@ -74,12 +74,27 @@ pub const DefinedFunction = struct {
     params: std.ArrayList(Token),
     body: std.ArrayList(Stmt),
     closure: *Environment,
+    instance_id: ?u64 = null,
+    is_init: bool = false,
 
-    fn arity(self: Self, _: *Interpreter) usize {
+    pub fn arity(self: Self, _: *Interpreter) usize {
         return self.params.items.len;
     }
 
-    fn call(self: Self, interpreter: *Interpreter, args: []Value) Error!Value {
+    pub fn bind(self: Self, allocator: std.mem.Allocator, instance: ClassInstance) Error!DefinedFunction {
+        var env = Environment.with_enclosing(allocator, self.closure);
+        try env.define("this", Value{ .ClassInstance = instance });
+        return DefinedFunction{
+            .id = self.id,
+            .name = self.name,
+            .params = self.params,
+            .body = self.body,
+            .closure = &env,
+            .instance_id = instance.id,
+        };
+    }
+
+    pub fn call(self: Self, interpreter: *Interpreter, args: []Value) Error!Value {
         var env = Environment.with_enclosing(interpreter.allocator, self.closure);
         for (self.params.items, 0..) |val, i| {
             try env.define(val.lexeme, args[i]);
@@ -132,9 +147,17 @@ pub const ClassInstance = struct {
         return Value{ .Nil = undefined };
     }
 
-    pub fn get(self: Self, name: []const u8) Error!Value {
+    pub fn get(self: Self, allocator: std.mem.Allocator, name: []const u8) Error!Value {
         if (self.fields.get(name)) |val| {
             return val;
+        }
+
+        if (self.class.find_method(name)) |method| {
+            const func = switch (method) {
+                .DefFunc => |f| try f.bind(allocator, self),
+                else => unreachable,
+            };
+            return Value{ .DefFunc = func };
         }
         return error.UndefinedProperty;
     }
@@ -148,19 +171,54 @@ pub const Class = struct {
     const Self = @This();
     id: u64,
     name: []const u8,
+    methods: std.StringArrayHashMap(DefinedFunction),
 
-    fn arity(_: Self, _: *Interpreter) usize {
+    pub fn init(id: u64, name: []const u8, allocator: std.mem.Allocator) Self {
+        return Self{
+            .id = id,
+            .name = name,
+            .methods = std.StringArrayHashMap(DefinedFunction).init(allocator),
+        };
+    }
+    pub fn arity(self: Self, interpreter: *Interpreter) usize {
+        if (self.find_method("init")) |initializer| {
+            switch (initializer) {
+                .DefFunc => |f| {
+                    return f.arity(interpreter);
+                },
+                else => unreachable,
+            }
+        }
         return 0;
     }
 
-    pub fn call(self: Self, interpreter: *Interpreter, _: []Value) Error!Value {
-        const instance = ClassInstance.init(982, self, interpreter.allocator);
+    pub fn find_method(self: Self, name: []const u8) ?Value {
+        if (self.methods.get(name)) |method| {
+            return Value{ .DefFunc = method };
+        } else {
+            return null;
+        }
+    }
+
+    pub fn call(self: Self, instance_id: u64, interpreter: *Interpreter, args: []Value) Error!Value {
+        const instance = ClassInstance.init(instance_id, self, interpreter.allocator);
+
+        if (self.find_method("init")) |initializer| {
+            switch (initializer) {
+                .DefFunc => |f| {
+                    var binded = try f.bind(interpreter.allocator, instance);
+                    _ = try binded.call(interpreter, args);
+                },
+                else => unreachable,
+            }
+        }
+
         // try instance.set("native_prop", Value{ .String = "test" });
-        return Value{ .ClassInstance = .{ .ClassInstance = instance } };
+        return Value{ .ClassInstance = instance };
     }
 };
 
-pub fn def_clock() Callable {
+pub fn def_clock() NativeFunction {
     const clock_native = struct {
         fn call(_: NativeFunction, _: *Interpreter, _: []Value) Error!Value {
             return Value{ .Number = @floatFromInt(std.time.nanoTimestamp()) };
@@ -173,7 +231,7 @@ pub fn def_clock() Callable {
         .name = "clock",
         .callable = clock_native.call,
     };
-    return Callable{ .NativeFunction = native };
+    return native;
 }
 
 test "Class and Attributes" {
@@ -183,12 +241,12 @@ test "Class and Attributes" {
     var int = Interpreter.init(allocator);
     const args = [_]Value{};
 
-    var class = Class{ .id = 0, .name = "Test" };
-    const callable = try class.call(&int, &args);
+    var class = Class.init(0, "test", allocator);
+    const callable = try class.call(1, &int, &args);
 
-    var instance = callable.ClassInstance.ClassInstance;
+    var instance = callable.ClassInstance;
     try instance.set("test_prop", Value{ .String = "Value" });
-    const val = try instance.get("test_prop");
+    const val = try instance.get(allocator, "test_prop");
 
     try std.testing.expectEqualStrings("Value", val.String);
 }

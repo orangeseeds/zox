@@ -19,13 +19,15 @@ pub const RuntimeError = error{
     MismatchedArity,
     OnlyInstancesHaveProperties,
     UndefinedProperty,
+    InstanceNotFound,
 } || std.mem.Allocator.Error;
 
 pub const ValueType = enum {
     Number,
     String,
     Bool,
-    Func,
+    NativeFunc,
+    DefFunc,
     Class,
     ClassInstance,
     Nil,
@@ -36,9 +38,10 @@ pub const Value = union(ValueType) {
     Number: f64,
     String: []const u8,
     Bool: bool,
-    Func: callable.Callable,
-    Class: callable.Callable,
-    ClassInstance: callable.Callable,
+    NativeFunc: callable.NativeFunction,
+    DefFunc: callable.DefinedFunction,
+    Class: callable.Class,
+    ClassInstance: callable.ClassInstance,
     Nil,
 
     pub fn equal(self: Value, other: Value) bool {
@@ -77,6 +80,8 @@ fn check_op_types(expected: ValueType, left: Value, right: Value) bool {
     return check_op_type(expected, left) and check_op_type(expected, right);
 }
 
+pub const ClassType = enum { CLASS, NONE };
+
 pub const Interpreter = struct {
     const Self = @This();
     const Error = struct {
@@ -99,10 +104,12 @@ pub const Interpreter = struct {
     class_instances: std.AutoArrayHashMap(u64, callable.ClassInstance),
     functions: std.AutoArrayHashMap(u64, callable.DefinedFunction),
 
+    curr_class: ClassType = .NONE,
+
     pub fn init(allocator: Allocator) Self {
         var globals = env.Environment.init(allocator);
         const clock = callable.def_clock();
-        globals.define("clock", Value{ .Func = clock }) catch {
+        globals.define("clock", Value{ .NativeFunc = clock }) catch {
             @panic("Error defining native functions.");
         };
 
@@ -260,17 +267,24 @@ pub const Interpreter = struct {
     fn interpret_get_expr(self: *Self, e: expr.GetExpr) RuntimeError!Value {
         const obj = try self.interpret_expr(e.object.*);
         switch (obj) {
-            .ClassInstance => |i| switch (i) {
-                .ClassInstance => |ci| {
-                    return ci.get(e.name.lexeme) catch {
+            .ClassInstance => |instance| {
+                if (self.class_instances.get(instance.id)) |i| {
+                    return i.get(self.allocator, e.name.lexeme) catch {
                         try self.raise_err(error.UndefinedProperty, e.name, "Undefined property line={d},col={d}", .{
                             e.name.line_num,
                             e.name.col,
                         });
                         return error.UndefinedProperty;
                     };
-                },
-                else => {},
+                } else {
+                    try self.raise_err(error.UndefinedProperty, e.name, "Instance of Class '{s}' of id={d} at line={d},col={d} not found", .{
+                        instance.class.name,
+                        instance.id,
+                        e.name.line_num,
+                        e.name.col,
+                    });
+                    return error.InstanceNotFound;
+                }
             },
             else => {},
         }
@@ -279,19 +293,21 @@ pub const Interpreter = struct {
     }
 
     fn interpret_set_expr(self: *Self, e: expr.SetExpr) RuntimeError!Value {
-        var obj = try self.interpret_expr(e.object.*);
+        const obj = try self.interpret_expr(e.object.*);
         switch (obj) {
-            .ClassInstance => |i| switch (i) {
-                .ClassInstance => {
-                    const value = try self.interpret_expr(e.val.*);
-                    try obj.ClassInstance.ClassInstance.set(e.name.lexeme, value);
-                    // e.object = obj;
-                    self.environment.assign(scanner.Token.init(.IDENTIFIER, "test", null, 10, 10), obj) catch unreachable;
-                    return value;
-                },
-                else => {},
+            .ClassInstance => |ci| {
+                const value = try self.interpret_expr(e.val.*);
+
+                if (self.class_instances.getPtr(ci.id)) |instance| {
+                    try instance.set(e.name.lexeme, value);
+                } else {
+                    return error.InstanceNotFound;
+                }
+                // e.object = obj;
+                // self.environment.assign(scanner.Token.init(.IDENTIFIER, "test", null, 10, 10), obj) catch unreachable;
+                return value;
             },
-            else => {},
+            else => unreachable,
         }
         try self.raise_err(error.OnlyInstancesHaveProperties, scanner.Token.init(.FUN, "fun", null, 100, 100), "Only instances have fields line={d},col={d}", .{ 100, 100 });
         return error.OnlyInstancesHaveProperties;
@@ -308,6 +324,7 @@ pub const Interpreter = struct {
             .Call => |c| try self.interpret_call_expr(c),
             .GetExpr => |g| try self.interpret_get_expr(g),
             .SetExpr => |s| try self.interpret_set_expr(s),
+            .ThisExpr => |t| try self.interpret_this_expr(t),
             else => unreachable,
         };
     }
@@ -337,6 +354,16 @@ pub const Interpreter = struct {
         }
     }
 
+    fn check_arity(self: *Self, token: scanner.Token, args_len: usize, fun_arity: usize) RuntimeError!void {
+        if (args_len != fun_arity) {
+            try self.raise_err(error.InvalidCallAttempt, token, "Expected {d} arguments but got {d}", .{
+                fun_arity,
+                args_len,
+            });
+            return error.MismatchedArity;
+        }
+    }
+
     fn interpret_call_expr(self: *Self, e: expr.CallExpr) RuntimeError!Value {
         // const callee = self.environment.get("clock") catch @panic("err");
         std.debug.print("Here!!\n", .{});
@@ -349,37 +376,66 @@ pub const Interpreter = struct {
         }
 
         // this could either be a function or a class constructor.
-        var func = switch (callee) {
-            .Func => |f| f,
-            .Class => |c| c,
+        switch (callee) {
+            .DefFunc => |f| {
+                if (f.instance_id) |_| {
+                    const enc_class = self.curr_class;
+                    self.curr_class = .CLASS;
+
+                    // checking if number of expected parameters = number of passed arguements in a function call
+                    try self.check_arity(e.paren, args.items.len, f.arity(self));
+                    const result = try f.call(self, args.items);
+                    self.curr_class = enc_class;
+                    return result;
+                } else {
+                    return try f.call(self, args.items);
+                }
+            },
+            .NativeFunc => |f| {
+                try self.check_arity(e.paren, args.items.len, f.arity(self));
+                return try f.call(self, args.items);
+            },
+            .Class => |f| {
+                const enc_class = self.curr_class;
+                self.curr_class = .CLASS;
+
+                try self.check_arity(e.paren, args.items.len, f.arity(self));
+                const instance = try f.call(self.generate_id(), self, args.items);
+
+                try self.class_instances.put(instance.ClassInstance.id, instance.ClassInstance);
+
+                self.curr_class = enc_class;
+                return instance;
+            },
             else => {
                 try self.raise_err(error.InvalidCallAttempt, e.paren, "Can only call functions and classes.", .{});
                 return error.InvalidCallAttempt;
             },
-        };
-
-        // checking if number of expected parameters = number of passed arguements in a function call
-        if (args.items.len != func.arity(self)) {
-            try self.raise_err(error.InvalidCallAttempt, e.paren, "Expected {d} arguments but got {d}", .{
-                func.arity(self),
-                args.items.len,
-            });
-            return error.MismatchedArity;
         }
+    }
 
-        // const call_result = try self.allocator.create(Value);
-        // call_result.* = try func.call(self, args.items);
-        // // switch (callee) {
-        // //     .Class => {
-        // //         var result =
-        // //         try result.ClassInstance.ClassInstance.set("native_prop_1", Value{ .String = "test" });
-        // //         return result;
-        // //     },
-        // //     else => {
-        //         return try func.call(self, args.items);
-        //     },
-        // }
-        return try func.call(self, args.items);
+    pub fn interpret_this_expr(self: *Self, e: expr.ThisExpr) RuntimeError!Value {
+        switch (self.curr_class) {
+            .CLASS => {
+                const val = self.environment.get(e.keyword.lexeme) catch {
+                    try self.raise_err(
+                        error.UndefinedVar,
+                        e.keyword,
+                        "'this' is not defined in this context line={d},col={d}.",
+                        .{ e.keyword.line_num, e.keyword.col },
+                    );
+                    return error.UndefinedVar;
+                };
+                return val;
+            },
+            .NONE => {
+                try self.raise_err(error.InvalidCallAttempt, e.keyword, "Can't use 'this' outside of a class line={d}, col={d}", .{
+                    e.keyword.line_num,
+                    e.keyword.col,
+                });
+                return error.InvalidCallAttempt;
+            },
+        }
     }
 
     pub fn execute_stmt(self: *Self, stmt: expr.Stmt) RuntimeError!void {
@@ -390,12 +446,29 @@ pub const Interpreter = struct {
                 try self.interpret_block(e, env.Environment.with_enclosing(self.allocator, enclosing));
             },
             .ClassStmt => |c| {
+                // std.debug.print("{any}", .{c.methods.items});
                 try self.environment.define(c.name.lexeme, null);
-                const class = callable.Class{
-                    .name = c.name.lexeme,
-                    .id = self.generate_id(),
-                };
-                try self.environment.define(c.name.lexeme, Value{ .Class = callable.Callable{ .Class = class } });
+                var class = callable.Class.init(self.generate_id(), c.name.lexeme, self.allocator);
+
+                for (c.methods.items) |method| {
+                    switch (method) {
+                        .FuncStmt => |f| {
+                            const closure = try self.allocator.create(env.Environment);
+                            try class.methods.put(f.name.lexeme, callable.DefinedFunction{
+                                .id = self.generate_id(),
+                                .name = f.name.lexeme,
+                                .params = try f.params.clone(),
+                                .closure = closure,
+                                .body = try f.body.clone(),
+                                .instance_id = 10,
+                                .is_init = std.mem.eql(u8, f.name.lexeme, "init"),
+                            });
+                        },
+                        else => unreachable,
+                    }
+                }
+                try self.environment.define(c.name.lexeme, Value{ .Class = class });
+                try self.classes.put(self.generate_id(), class);
             },
             .ExprStmt => |e| {
                 _ = try self.interpret_expr(e);
@@ -411,8 +484,9 @@ pub const Interpreter = struct {
                     .body = try f.body.clone(),
                 };
 
-                try self.environment.define(f.name.lexeme, Value{ .Func = callable.Callable{ .DefinedFunction = func } });
-                try func.closure.define(f.name.lexeme, Value{ .Func = callable.Callable{ .DefinedFunction = func } });
+                try self.environment.define(f.name.lexeme, Value{ .DefFunc = func });
+                try func.closure.define(f.name.lexeme, Value{ .DefFunc = func });
+                try self.functions.put(self.generate_id(), func);
             },
             .IfStmt => |i| {
                 var condition = try self.interpret_expr(i.condition);
@@ -432,9 +506,10 @@ pub const Interpreter = struct {
                     .Number => |num| std.debug.print("{d}", .{num}),
                     .Bool => |b| std.debug.print("{?}", .{b}),
                     .Nil => std.debug.print("nil", .{}),
-                    .Func => |f| std.debug.print("func {s}", .{f.name()}),
-                    .Class => |c| std.debug.print("class {s}", .{c.name()}),
-                    .ClassInstance => |i| std.debug.print("instance {s}", .{i.name()}),
+                    .NativeFunc => |f| std.debug.print("func {s}", .{f.name}),
+                    .DefFunc => |f| std.debug.print("func {s}", .{f.name}),
+                    .Class => |c| std.debug.print("class {s}", .{c.name}),
+                    .ClassInstance => |i| std.debug.print("instance of {s}", .{i.class.name}),
                 }
             },
             .ReturnStmt => |r| {
@@ -481,19 +556,18 @@ test "Defined Func Stmt" {
     const allocator = arena.allocator();
 
     const src =
-        // \\ var y = 20;
-        // \\ fun ball(b) {
-        // \\ return b+10;
-        // \\ }
-        // \\
-        // \\ fun apple(a) {
-        // \\ return ball(a)+10;
-        // \\ }
-        // \\
-        // \\ print apple(y);
-        \\ class Test {}
-        \\ var test = Test();
-        \\ test.name = 10;
+        \\ class Person{
+        \\ init(){
+        \\ this.name = "class_name";
+        \\ }
+        \\ sayName(){
+        \\ print this.name;
+        \\ }
+        \\ }
+        \\ 
+        \\
+        \\ var person = Person();
+        \\ person.sayName();
     ;
 
     var lexer = try scanner.Scanner.init(allocator, src);
@@ -520,12 +594,14 @@ test "Defined Func Stmt" {
         }
     };
 
-    const inst = try interpreter.environment.get("test");
-
-    std.debug.print("\nInstance: {any}\n", .{inst});
-    for (inst.ClassInstance.ClassInstance.fields.keys()) |field| {
-        std.debug.print("\nKey: {s}\n", .{field});
-    }
+    // const inst = try interpreter.environment.get("test");
+    //
+    // for (interpreter.class_instances.get(inst.ClassInstance.id).?.fields.keys()) |field| {
+    //     const instance = try interpreter.class_instances.get(inst.ClassInstance.id).?.get(field);
+    //     const child_name = try interpreter.class_instances.get(instance.ClassInstance.id).?
+    //         .get("name");
+    //     std.debug.print("\nKey: {s} , Val: {s}\n", .{ field, child_name.String });
+    // }
 
     std.debug.print("\n", .{});
 }

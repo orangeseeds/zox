@@ -18,6 +18,7 @@ pub const LogicalExpr = struct { left: *Expr, operator: Token, right: *Expr };
 pub const CallExpr = struct { callee: *Expr, paren: Token, args: std.ArrayList(Expr) };
 pub const BlockExpr = std.ArrayList(Expr);
 pub const SetExpr = struct { object: *Expr, name: Token, val: *Expr };
+pub const ThisExpr = struct { keyword: Token };
 
 pub const Expr = union(enum) {
     const Self = @This();
@@ -32,6 +33,7 @@ pub const Expr = union(enum) {
     Block: BlockExpr,
     GetExpr: GetExpr,
     SetExpr: SetExpr,
+    ThisExpr: ThisExpr,
 
     fn parenthesize_recur(self: Self, allocator: std.mem.Allocator, buff: *std.ArrayList(u8), expr: Expr) !void {
         // std.debug.print("Test: {any}\n", .{expr});
@@ -109,6 +111,9 @@ pub const Expr = union(enum) {
                 try buff.writer().print(".(setter {s})", .{s.name.lexeme});
                 try buff.writer().print("=", .{});
                 try self.parenthesize_recur(allocator, buff, s.val.*);
+            },
+            .ThisExpr => {
+                try buff.writer().print(" this ", .{});
             },
         }
     }
